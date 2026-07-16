@@ -2,12 +2,14 @@
 
 import envlib
 import numpy as np
-import pandas as pd
 import shapely
 from cfdb import open_dataset
 from envlib import Catalogue
 
 from envlib_ingest_base.tsortho import build_local, merge_dataset
+
+BASE = np.datetime64('2020-01-01T00:00', 'us')
+HOUR = np.timedelta64(1, 'h')
 
 
 def meta_streamflow():
@@ -28,35 +30,17 @@ def meta_streamflow():
     )
 
 
-def stations_df(refs_lonlat):
-    return pd.DataFrame(
-        {
-            'lon': [x[0] for x in refs_lonlat.values()],
-            'lat': [x[1] for x in refs_lonlat.values()],
-            'name': [x[2] for x in refs_lonlat.values()],
-        },
-        index=list(refs_lonlat.keys()),
-    )
-
-
-def hourly(ref_to_pairs):
-    out = {}
-    for ref, pairs in ref_to_pairs.items():
-        idx = pd.DatetimeIndex([p[0] for p in pairs], name='time')
-        out[ref] = pd.Series([p[1] for p in pairs], index=idx)
-    return out
-
-
-BASE = pd.Timestamp('2020-01-01 00:00')
+def stations_dict(refs_lonlat):
+    return {ref: {'lon': x[0], 'lat': x[1], 'name': x[2]} for ref, x in refs_lonlat.items()}
 
 
 def _series(ref_vals, start=BASE, n=4):
-    idx = pd.date_range(start, periods=n, freq='1h')
-    return {ref: pd.Series(vals, index=idx) for ref, vals in ref_vals.items()}
+    times = start + HOUR * np.arange(n)
+    return {ref: (times, np.asarray(vals, dtype='float64')) for ref, vals in ref_vals.items()}
 
 
 def test_build_and_validate(tmp_path):
-    stns = stations_df({'A': (172.5, -43.5, 'Alpha'), 'B': (171.9, -43.1, 'Bravo')})
+    stns = stations_dict({'A': (172.5, -43.5, 'Alpha'), 'B': (171.9, -43.1, 'Bravo')})
     h = _series({'A': [1.0, 2.0, 3.0, 4.0], 'B': [10.0, 11.0, 12.0, 13.0]})
     p = tmp_path / 'sf.cfdb'
     build_local(
@@ -80,7 +64,7 @@ def test_build_and_validate(tmp_path):
 
 
 def test_merge_idempotent(tmp_path):
-    stns = stations_df({'A': (172.5, -43.5, 'Alpha'), 'B': (171.9, -43.1, 'Bravo')})
+    stns = stations_dict({'A': (172.5, -43.5, 'Alpha'), 'B': (171.9, -43.1, 'Bravo')})
     h = _series({'A': [1.0, 2.0, 3.0, 4.0], 'B': [10.0, 11.0, 12.0, 13.0]})
     p = tmp_path / 'sf.cfdb'
     build_local(
@@ -88,7 +72,7 @@ def test_merge_idempotent(tmp_path):
     )
 
     # a window that overlaps the last 2 hours and adds 2 new hours (revised + new)
-    win = _series({'A': [30.0, 40.0, 50.0, 60.0], 'B': [12.0, 13.0, 14.0, 15.0]}, start=BASE + pd.Timedelta('2h'), n=4)
+    win = _series({'A': [30.0, 40.0, 50.0, 60.0], 'B': [12.0, 13.0, 14.0, 15.0]}, start=BASE + 2 * HOUR, n=4)
 
     def run_merge():
         with open_dataset(str(p), flag='w') as ds:
@@ -97,14 +81,14 @@ def test_merge_idempotent(tmp_path):
     r1 = run_merge()
     with open_dataset(str(p)) as ds:
         a1 = ds['streamflow'][:].data.copy()
-        t1 = pd.DatetimeIndex(ds['time'].data)
+        t1 = np.asarray(ds['time'].data, dtype='datetime64[us]')
     r2 = run_merge()  # second identical run
     with open_dataset(str(p)) as ds:
         a2 = ds['streamflow'][:].data.copy()
-        t2 = pd.DatetimeIndex(ds['time'].data)
+        t2 = np.asarray(ds['time'].data, dtype='datetime64[us]')
 
     assert r1['new_hours'] == 2 and r2['new_hours'] == 0  # second run adds nothing
-    assert t1.equals(t2)
+    assert np.array_equal(t1, t2)
     np.testing.assert_array_equal(np.nan_to_num(a1, nan=-1), np.nan_to_num(a2, nan=-1))
     # revised hour 2 overwritten; new hours appended
     row_a = a2[0]
@@ -112,18 +96,16 @@ def test_merge_idempotent(tmp_path):
 
 
 def test_merge_offline_station_not_clobbered(tmp_path):
-    stns = stations_df({'A': (172.5, -43.5, 'Alpha'), 'B': (171.9, -43.1, 'Bravo')})
+    stns = stations_dict({'A': (172.5, -43.5, 'Alpha'), 'B': (171.9, -43.1, 'Bravo')})
     h = _series({'A': [1.0, 2.0, 3.0, 4.0], 'B': [10.0, 11.0, 12.0, 13.0]})
     p = tmp_path / 'sf.cfdb'
     build_local(
         p, meta_streamflow(), stns, h, variable='streamflow', units='m^3/s', precision=4, min_value=0, max_value=100000
     )
 
-    # only A reports this window (B offline) -> B's existing hours must survive
-    win = {
-        'A': pd.Series([300.0, 400.0], index=pd.date_range(BASE + pd.Timedelta('2h'), periods=2, freq='1h')),
-        'B': pd.Series(dtype='float64', index=pd.DatetimeIndex([], name='time')),
-    }
+    # only A reports this window (B offline, empty tuple) -> B's existing hours must survive
+    win = _series({'A': [300.0, 400.0]}, start=BASE + 2 * HOUR, n=2)
+    win['B'] = (np.empty(0, dtype='datetime64[us]'), np.empty(0, dtype='float64'))
     with open_dataset(str(p), flag='w') as ds:
         merge_dataset(ds, stns, win, variable='streamflow')
     with open_dataset(str(p)) as ds:
@@ -133,15 +115,15 @@ def test_merge_offline_station_not_clobbered(tmp_path):
 
 
 def test_merge_new_station(tmp_path):
-    stns = stations_df({'A': (172.5, -43.5, 'Alpha')})
+    stns = stations_dict({'A': (172.5, -43.5, 'Alpha')})
     h = _series({'A': [1.0, 2.0, 3.0, 4.0]})
     p = tmp_path / 'sf.cfdb'
     build_local(
         p, meta_streamflow(), stns, h, variable='streamflow', units='m^3/s', precision=4, min_value=0, max_value=100000
     )
 
-    stns2 = stations_df({'A': (172.5, -43.5, 'Alpha'), 'C': (170.0, -44.0, 'Charlie')})
-    win = _series({'A': [3.0, 4.0], 'C': [99.0, 98.0]}, start=BASE + pd.Timedelta('2h'), n=2)
+    stns2 = stations_dict({'A': (172.5, -43.5, 'Alpha'), 'C': (170.0, -44.0, 'Charlie')})
+    win = _series({'A': [3.0, 4.0], 'C': [99.0, 98.0]}, start=BASE + 2 * HOUR, n=2)
     with open_dataset(str(p), flag='w') as ds:
         r = merge_dataset(ds, stns2, win, variable='streamflow')
     assert r['new_stations'] == 1
@@ -157,15 +139,15 @@ def test_merge_new_station(tmp_path):
 
 
 def test_merge_ignores_stations_without_data(tmp_path):
-    # `stations` may be the full discovery frame; a station with no data this window must NOT be added
-    stns = stations_df({'A': (172.5, -43.5, 'Alpha')})
+    # `stations` may be the full discovery dict; a station with no data this window must NOT be added
+    stns = stations_dict({'A': (172.5, -43.5, 'Alpha')})
     h = _series({'A': [1.0, 2.0, 3.0, 4.0]})
     p = tmp_path / 'sf.cfdb'
     build_local(
         p, meta_streamflow(), stns, h, variable='streamflow', units='m^3/s', precision=4, min_value=0, max_value=100000
     )
-    full = stations_df({'A': (172.5, -43.5, 'Alpha'), 'D': (170.5, -43.8, 'Delta')})  # D has no data
-    win = _series({'A': [3.0, 4.0]}, start=BASE + pd.Timedelta('2h'), n=2)  # only A reports
+    full = stations_dict({'A': (172.5, -43.5, 'Alpha'), 'D': (170.5, -43.8, 'Delta')})  # D has no data
+    win = _series({'A': [3.0, 4.0]}, start=BASE + 2 * HOUR, n=2)  # only A reports
     with open_dataset(str(p), flag='w') as ds:
         r = merge_dataset(ds, full, win, variable='streamflow')
     assert r['new_stations'] == 0

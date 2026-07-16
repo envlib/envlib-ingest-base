@@ -11,10 +11,11 @@ classifiers = [
 requires-python = ">=3.10"
 dependencies = [
   # Released PyPI stack only - ingest repos are arm's-length consumers.
+  # Deliberately pandas-free: the API is numpy tuples/dicts (pandas objects still
+  # work as *inputs* by duck-typing).
   "envlib>=0.1.2",
   "cfdb>=0.9.3",
   "ebooklet>=0.10.1",
-  "pandas",
   "numpy",
   "shapely>=2.0",
 ]
@@ -24,6 +25,7 @@ dev = [
   "pytest",
   "ruff",
   "black",
+  "pandas",  # dev-only: fixtures pin the pandas-input duck-typing promise
   "tomli; python_version < '3.11'",
 ]
 

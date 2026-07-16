@@ -193,14 +193,14 @@ dependencies = [
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
     { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
-    { name = "pandas", version = "2.3.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "pandas", version = "3.0.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "shapely" },
 ]
 
 [package.dev-dependencies]
 dev = [
     { name = "black" },
+    { name = "pandas", version = "2.3.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "pandas", version = "3.0.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "pytest" },
     { name = "ruff" },
     { name = "tomli", marker = "python_full_version < '3.11'" },
@@ -212,13 +212,13 @@ requires-dist = [
     { name = "ebooklet", specifier = ">=0.10.1" },
     { name = "envlib", specifier = ">=0.1.2" },
     { name = "numpy" },
-    { name = "pandas" },
     { name = "shapely", specifier = ">=2.0" },
 ]
 
 [package.metadata.requires-dev]
 dev = [
     { name = "black" },
+    { name = "pandas" },
     { name = "pytest" },
     { name = "ruff" },
     { name = "tomli", marker = "python_full_version < '3.11'" },
