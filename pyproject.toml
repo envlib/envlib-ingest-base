@@ -1,0 +1,85 @@
+[project]
+name = "envlib-ingest-base"
+authors = [{ name = "mullenkamp", email = "mullenkamp1@gmail.com" }]
+description = "Shared toolkit for envlib data-ingest repos: source-agnostic time-series resampling and ts_ortho (station) dataset build + idempotent commons update."
+readme = "README.md"
+license = "Apache-2.0"
+dynamic = ["version"]
+classifiers = [
+  "Programming Language :: Python :: 3 :: Only",
+]
+requires-python = ">=3.10"
+dependencies = [
+  # Released PyPI stack only - ingest repos are arm's-length consumers.
+  "envlib>=0.1.2",
+  "cfdb>=0.9.3",
+  "ebooklet>=0.10.1",
+  "pandas",
+  "numpy",
+  "shapely>=2.0",
+]
+
+[dependency-groups]
+dev = [
+  "pytest",
+  "ruff",
+  "black",
+  "tomli; python_version < '3.11'",
+]
+
+[project.urls]
+Source = "https://github.com/envlib/envlib-ingest-base"
+
+[build-system]
+requires = ["hatchling>=1.26.1"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "envlib_ingest_base/__init__.py"
+
+[tool.hatch.build.targets.sdist]
+include = ["/envlib_ingest_base"]
+exclude = ["/envlib_ingest_base/tests/*"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["envlib_ingest_base"]
+exclude = ["/envlib_ingest_base/tests"]
+
+[tool.pytest.ini_options]
+testpaths = ["envlib_ingest_base/tests"]
+
+[tool.black]
+target-version = ["py310"]
+line-length = 120
+skip-string-normalization = true
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+
+[tool.ruff.lint]
+select = [
+  "A", "ARG", "B", "C", "DTZ", "E", "EM", "F", "FBT", "I", "ICN", "ISC", "N",
+  "PLC", "PLE", "PLR", "PLW", "Q", "RUF", "S", "T", "TID", "UP", "W", "YTT",
+]
+ignore = [
+  "B027",
+  "FBT003",
+  "S105", "S106", "S107",
+  "C901", "PLR0911", "PLR0912", "PLR0913", "PLR0915",
+]
+unfixable = ["F401"]
+
+[tool.ruff.lint.flake8-quotes]
+inline-quotes = "single"
+multiline-quotes = "single"
+
+[tool.ruff.lint.isort]
+known-first-party = ["envlib_ingest_base"]
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"
+
+[tool.ruff.lint.per-file-ignores]
+# Tests can use magic values, assertions, and relative imports
+"envlib_ingest_base/tests/**/*" = ["PLR2004", "S101", "TID252"]

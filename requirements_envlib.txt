@@ -1,0 +1,5 @@
+# The envlib stack (faster-moving; second layer so a stack bump doesn't invalidate the base).
+# Released PyPI only - ingest repos are arm's-length consumers of the stack.
+envlib>=0.1.2
+cfdb>=0.9.3
+ebooklet>=0.10.1

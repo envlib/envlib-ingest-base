@@ -1,0 +1,7 @@
+# Records the published base-image tag (bump on each rebuild). Build: `docker compose build`.
+# Namespace is a placeholder - set to your Docker Hub namespace.
+services:
+  base:
+    image: mullenkamp/envlib-ingest-base:0.1
+    build:
+      context: .
