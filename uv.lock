@@ -83,7 +83,7 @@ wheels = [
 
 [[package]]
 name = "cfdb"
-version = "0.9.3"
+version = "0.9.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "booklet" },
@@ -101,9 +101,9 @@ dependencies = [
     { name = "shapely" },
     { name = "zstandard" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/82/76/565844107c2a93ad11ba7db080996df53682e7c3b2ae5f5e0e52d6063f26/cfdb-0.9.3.tar.gz", hash = "sha256:9f2d99c364ec830b7afc667275409f71c66cc81be8af2bbbf2e8066b53035af3", size = 68450, upload-time = "2026-07-14T04:28:22.347Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/c8/c9/1f19dbc1d8deacce8a119841e09def36d24be0b80d8f4b49a87504577191/cfdb-0.9.4.tar.gz", hash = "sha256:46d7d64ec5492534635576f8956cb218d697a051fd7c092a8a21da60886b0098", size = 69317, upload-time = "2026-07-18T03:52:42.286Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/12/a7/91397ff493f54a2751d4f0dae483fc5b33776ad5c79d888da6729d5ca590/cfdb-0.9.3-py3-none-any.whl", hash = "sha256:430cf9c6dade63229ab753390bb1fd86b873304c05335d31a96d955a9dd08699", size = 75385, upload-time = "2026-07-14T04:28:20.843Z" },
+    { url = "https://files.pythonhosted.org/packages/7f/e2/f9fedf561ebecf590e67b347bdc55520aaaada0370884a83872cf62720bb/cfdb-0.9.4-py3-none-any.whl", hash = "sha256:17e26a7bd45d6b4e1d7bd7be273864cb0dd23fbc2420ff88a5c773c4578eb6ad", size = 76307, upload-time = "2026-07-18T03:52:40.751Z" },
 ]
 
 [[package]]
@@ -208,7 +208,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "cfdb", specifier = ">=0.9.3" },
+    { name = "cfdb", specifier = ">=0.9.4" },
     { name = "ebooklet", specifier = ">=0.10.1" },
     { name = "envlib", specifier = ">=0.1.2" },
     { name = "numpy" },

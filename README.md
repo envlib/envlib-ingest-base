@@ -25,9 +25,9 @@ envlib-ingest-base = { path = "../envlib-ingest-base", editable = true }
 
 ```python
 from envlib_ingest_base import (
-    resample_mean, resample_sum, resample_station,   # resampling
-    build_local, merge_dataset,                       # ts_ortho (cfdb-level)
-    build_and_publish, update_and_publish,            # ts_ortho + commons publish
+    resample,                               # resampling (statistic keyed to envlib metadata)
+    build_local, merge_dataset,             # ts_ortho (cfdb-level)
+    build_and_publish, update_and_publish,  # ts_ortho + commons publish
 )
 ```
 
@@ -38,7 +38,7 @@ from envlib_ingest_base import (
 Turn a single station's raw `(times, values)` into a fixed-cadence series, returned as a plain
 **`(times, values)` tuple**: ascending `datetime64[us]` **interval-start** labels (envlib
 convention; pass UTC in, get UTC out) + `float64` values. Unpack immediately —
-`t, v = resample_mean(...)` — and test emptiness as `t.size == 0` (never `len()`/truthiness on
+`t, v = resample(...)` — and test emptiness as `t.size == 0` (never `len()`/truthiness on
 the pair itself, which is always 2/truthy).
 
 **Inputs** are anything convertible to `datetime64`: ISO-format strings, `datetime64` arrays of
@@ -48,33 +48,76 @@ UTC-naive) — no pandas required by the toolkit itself. Time is handled in **mi
 practice). `None`/`NaT`/`NaN` entries are dropped; non-numeric values raise rather than
 coercing silently.
 
-Two kinds, matching the two physical measurement types. Gaps are first-class: consecutive
-observations farther apart than `max_gap` are a *hole* the signal is never interpolated across.
-Both kinds are epoch-anchored (labels are multiples of `freq` since 1970-01-01) — identical to
-pandas for any `freq` that divides 24 h.
+Two kinds, matching the two physical measurement types. Both are epoch-anchored (labels are
+multiples of `freq` since 1970-01-01) — identical to pandas for any `freq` that divides 24 h.
+
+### Missing data and aggregation rules
+
+These rules are the core of the toolkit and deliberate (design rulings 2026-07-17/18); read
+them before producing a dataset.
+
+**The estimator spans beyond the aggregation interval and must be told where to stop
+(`max_gap`); once stopped, each interval is judged by how much of it remains covered
+(`min_coverage`).** The two rules are anchored to two different clocks and are NOT derivable
+from each other:
+
+1. **The gap rule — the data's clock.** The mean treats the signal as piecewise-linear
+   between consecutive readings, regardless of interval boundaries — so it needs a rule for
+   when interpolation stops being honest. That rule is a property of the *source's sampling
+   design*, never of the output frequency: by default, a segment longer than
+   `gap_multiplier ×` the **local median native interval** is a *hole* that is never
+   interpolated across. The median is local (a rolling window of segments), so a station
+   that logged 30-min data twenty years ago and 5-min data today is judged by each era's own
+   cadence — a global median would misclassify one era wholesale. A 5-min site therefore
+   gets a ~15-min threshold and a 60-min site ~3 h, at any output freq.
+2. **The coverage rule — the output's clock.** After holes are excluded, an interval covered
+   below `min_coverage` is **absent** rather than summarized from too little data. The
+   default `0.75` follows common climatological completeness practice and is deliberately
+   conservative: telemetry missingness is not random — outages correlate with the extreme
+   events you most want recorded. For the mean, coverage is the non-hole time fraction; for
+   the **sum**, each reading covers its accumulation slot, capped at **one local native
+   interval** — a reading after skipped slots covers only its own slot, so losses are never
+   credited as measured. An hour holding 8 of its 12 five-minute rain slots is *missing*,
+   never published as a silent undercount, and a single-reading series has an unknowable
+   slot and contributes no coverage (kept only when `min_coverage=0`).
+
+Sums assume **per-slot totals** (each reading is the accumulation over its own reporting
+slot). Feeds from totalizing gauges (since-last-report accumulations) must be differenced
+upstream, and resampling accumulations *finer* than their native interval is not meaningful.
 
 Common parameters:
 
 | param | default | meaning |
 |---|---|---|
-| `freq` | `'1h'` | output cadence: `'<n><unit>'` with unit in `h`, `min`, `s`, `D` (e.g. `'1h'`, `'15min'`), or a `np.timedelta64` / `datetime.timedelta`. Anything else raises. |
-| `max_gap` | `None` | absolute hole threshold (same forms as `freq`, e.g. `'2h'`); `None` ⇒ adaptive (below). |
-| `gap_multiplier` | `3.0` | adaptive threshold = `gap_multiplier × median(native interval)`, so a 5-min site → ~15 min and a 60-min site → ~3 h. |
-| `min_coverage` | `0.5` | (`resample_mean` only) drop an interval covered less than this fraction. |
+| `freq` | `'1h'` | output cadence: `'<n><unit>'` with unit in `h`, `min`, `s`, `D` (e.g. `'1h'`, `'15min'`), the envlib CV code `'day'`, or a `np.timedelta64` / `datetime.timedelta`. Anything else — including `'0min'`, negative/NaT/calendar timedeltas — raises. |
+| `max_gap` | `None` | absolute hole threshold (same forms as `freq`, e.g. `'2h'`); `None` ⇒ adaptive (the local-median rule above). |
+| `gap_multiplier` | `3.0` | adaptive threshold = `gap_multiplier × local median(native interval)`. |
+| `min_coverage` | `0.75` | both kinds: an interval covered below this fraction is absent. `0` disables. Float comparison at the boundary — prefer binary-friendly fractions (0.75, 0.5). |
 | `round_to` | `None` | the source's **true timestamp precision** (same forms as `freq`, e.g. `'1min'`). Timestamps are rounded to the nearest multiple before binning — a boundary reading jittered to `11:00:01` bins into the correct hour, and two jittery renderings of one reading collide and merge via the duplicate collapse instead of double-counting. |
 
-### `resample_mean(times, values, *, freq='1h', max_gap=None, gap_multiplier=3.0, min_coverage=0.5)`
+### `resample(times, values, *, statistic='mean', freq='1h', max_gap=None, gap_multiplier=3.0, min_coverage=0.75, round_to=None)`
+
+One entry point; `statistic` selects both the aggregation and the signal model behind it — pass
+the dataset's envlib **`aggregation_statistic`** metadata value, so the declared identity and the
+computation can never drift (the same single-source-of-truth pattern tsortho uses for
+`frequency_interval`). Future statistics of the instantaneous signal (median/min/max share its
+segment machinery, differing only in the final reduction) will slot in without an API change;
+unknown values raise.
+
+#### `statistic='mean'` — instantaneous signals
 
 Exact **trapezoidal time-weighted mean** for an instantaneous signal (river stage, flow). The signal
 is treated as piecewise-linear between observations and integrated over each interval — exact for any
-spacing, and equal to the plain hourly mean for regularly-sampled data.
+spacing. For grid-aligned regular data this is the trapezoid-rule mean (interval endpoints carry
+half-weight): it coincides with the plain arithmetic mean for linear ramps but is NOT pandas'
+left-closed `.resample().mean()`.
 
 ```python
-from envlib_ingest_base import resample_mean
+from envlib_ingest_base import resample
 
 # irregular spacing: 10 @ 00:00, 20 @ 00:15, 100 @ 01:00
 times = ['2024-06-01 00:00', '2024-06-01 00:15', '2024-06-01 01:00']
-t, v = resample_mean(times, [10.0, 20.0, 100.0])
+t, v = resample(times, [10.0, 20.0, 100.0])
 # t -> ['2024-06-01T00:00']    (datetime64[us])
 # v -> [48.75]                 # time-weighted (the 45-min stretch near 100 dominates),
 #                              # NOT the equal-weight 37.5 a naive .resample().mean() gives
@@ -85,12 +128,12 @@ Gaps are dropped, never ramped across:
 ```python
 times = ['2024-06-01 00:00', '2024-06-01 01:00', '2024-06-01 02:00',
          '2024-06-01 12:00', '2024-06-01 13:00']
-t, v = resample_mean(times, [0.0, 0.0, 0.0, 120.0, 120.0])
+t, v = resample(times, [0.0, 0.0, 0.0, 120.0, 120.0])
 # t -> ['2024-06-01T00:00', '2024-06-01T01:00', '2024-06-01T12:00']
 # v -> [0.0, 0.0, 120.0]    # hours 02:00–11:00 are ABSENT (outage), not contaminated by 120
 ```
 
-### `resample_sum(times, values, *, freq='1h', max_gap=None, gap_multiplier=3.0)`
+#### `statistic='sum'` — accumulations
 
 Right-closed interval **sum** for an accumulation signal (rainfall): an interval with **no**
 reading is missing (absent from the output), never a fabricated `0`, while a genuinely reported
@@ -99,24 +142,20 @@ Duplicate timestamps collapse by mean before summing (the same reading served tw
 double-count).
 
 ```python
-from envlib_ingest_base import resample_sum
-
 # hourly rain totals; note the 03:00–06:00 outage
 times = ['2024-06-01 01:00', '2024-06-01 02:00', '2024-06-01 07:00']
-t, v = resample_sum(times, [0.0, 0.5, 1.0])
+t, v = resample(times, [0.0, 0.5, 1.0], statistic='sum')
 # t -> ['2024-06-01T00:00', '2024-06-01T01:00', '2024-06-01T06:00']
 # v -> [0.0, 0.5, 1.0]    # reported 0.0 kept (a confirmed dry hour);
 #                         # hours 02:00–05:00 ABSENT (no reading) — never fabricated as 0
 ```
 
-### `resample_station(times, values, kind, **kwargs)`
-
-Dispatch helper — `kind='mean'` → `resample_mean`, `kind='sum'` → `resample_sum`. Convenient when the
-aggregation is config-driven:
+Config-driven pipelines key both `statistic` and `freq` straight off the dataset's metadata:
 
 ```python
-from envlib_ingest_base import resample_station
-t, v = resample_station(times, values, cfg['kind'], gap_multiplier=3.0, min_coverage=0.5)
+t, v = resample(times, values,
+                statistic=cfg['metadata']['aggregation_statistic'],
+                freq=cfg['metadata']['frequency_interval'])
 ```
 
 ---
@@ -124,25 +163,47 @@ t, v = resample_station(times, values, cfg['kind'], gap_multiplier=3.0, min_cove
 ## Station datasets (`tsortho`)
 
 Build and update envlib `ts_ortho` datasets — an orthogonal `(point, time)` layout: a geometry
-coordinate of shapely Points (one per station), a shared dense hourly axis, one data variable named
-after `meta.variable`, and `station_id` (envlib's deterministic hash) + `station_name` per station.
+coordinate of shapely Points (one per station), a shared **dense fixed-step time axis at the
+cadence declared by `meta.frequency_interval`**, one data variable named after `meta.variable`,
+and `station_id` (envlib's deterministic hash) + `station_name` per station.
+
+**The envlib metadata is the single source of truth for the cadence** — there is no `freq`
+parameter. `frequency_interval` is a closed envlib vocabulary; only *fixed* codes work here
+(`1min`…`30min`, `1h`…`12h`, `day` — `month`/`year`/`None` raise, a dense axis needs a fixed
+duration). The time coordinate is stored in the cadence's **natural datetime64 unit** — a daily
+dataset reads as `datetime64[D]`, hourly as `[h]`, 15-min as `[m]` — with an explicit step, so
+the axis itself tells the reader the data's precision.
+
+Two guards keep declared and actual cadence honest (both fail loud):
+
+- *alignment* — every incoming timestamp must be an exact multiple of the declared step (the
+  `resample_*` labels are, by construction, when resampled at the same freq the metadata declares);
+- *phase* — a fixed cadence with a (reduced) `utc_offset` other than `+00:00` declares
+  phase-anchored binning (e.g. local-midnight days) that the epoch-anchored resampler can't
+  produce, and is rejected. Phase-anchored datasets are a planned follow-up (resampler `origin`).
+
+Two documented limits: data resampled *coarser* than declared (daily labels are valid hour
+multiples) builds a sparse-but-aligned axis the guards cannot detect; and string `.loc`/`truncate`
+queries on a published dataset are truncated by numpy to the axis unit (`'…T06:00'` on a `[D]`
+axis widens back to midnight — normal numpy semantics, worth knowing as a reader).
 
 Two inputs recur:
 
 - **`stations`** — a dict `{ref: {'lon': float, 'lat': float, 'name': str}}`. From a pandas
   frame indexed by ref with those columns: `df.to_dict('index')`.
-- **`hourly`** — a dict `{ref -> (times, values)}` of resampled hourly tuples (the output of
-  `resample_*`). Entries that are `None` or have `times.size == 0` are simply skipped.
+- **`series`** — a dict `{ref -> (times, values)}` of resampled tuples (the output of
+  `resample_*` at the metadata's freq). Entries that are `None` or have `times.size == 0` are
+  simply skipped.
 
 ```python
 import envlib
-from envlib_ingest_base import resample_mean
+from envlib_ingest_base import resample
 
 stations = {
     'A': {'lon': 172.5, 'lat': -43.5, 'name': 'River A at X'},
     'B': {'lon': 171.9, 'lat': -43.1, 'name': 'River B at Y'},
 }
-hourly = {'A': resample_mean(times_a, values_a), 'B': resample_mean(times_b, values_b)}
+series = {'A': resample(times_a, values_a), 'B': resample(times_b, values_b)}
 meta = envlib.Metadata(
     feature='waterway', variable='streamflow', method='sensor_recording', product_code=None,
     processing_level='raw', owner='ecan', aggregation_statistic='mean', frequency_interval='1h',
@@ -151,18 +212,23 @@ meta = envlib.Metadata(
 )
 ```
 
-### `build_local(path, meta, stations, hourly, *, variable, units, precision, min_value, max_value, chunk_shape=None, standard_name=None, extra_var_attrs=None)`
+### `build_local(path, meta, stations, series, *, variable, units, precision, min_value, max_value, chunk_shape=None, standard_name=None, extra_var_attrs=None)`
 
-Create a fresh local ts_ortho cfdb. `precision` is **decimal places** (cfdb picks the int packing width
-from `precision` + `min_value`/`max_value`); pass `standard_name` to override envlib's auto-derived CF
-name. Returns the path.
+Create a fresh local ts_ortho cfdb at the cadence of `meta.frequency_interval`. **Requires
+cfdb >= 0.9.4** (older versions fabricate values when the packed encoder meets NaN or
+out-of-range data — enforced at runtime). `min_value`/`max_value` are also the dataset's
+**QC bounds** (values outside them, including ±inf, are stored as missing — pick physical
+plausibility limits that cannot realistically be exceeded; persisted as `valid_min`/`valid_max`
+attrs so merges apply the same filter). `precision` is
+**decimal places** (cfdb picks the int packing width from `precision` + `min_value`/`max_value`);
+pass `standard_name` to override envlib's auto-derived CF name. Returns the path.
 
 ```python
 from envlib_ingest_base import build_local
 
-build_local('flow.cfdb', meta, stations, hourly,
+build_local('flow.cfdb', meta, stations, series,
             variable='streamflow', units='m^3/s',
-            precision=4, min_value=0, max_value=100_000)   # -> int32 packing, ~0.1 L/s resolution
+            precision=4, min_value=0, max_value=100_000)   # -> uint32 packing, ~0.1 L/s resolution
 ```
 
 The file validates against envlib directly:
@@ -172,21 +238,27 @@ from envlib import Catalogue
 Catalogue(remotes=[]).validate('flow.cfdb')   # {'metadata', 'dataset_version_id', 'state', ...}
 ```
 
-### `merge_dataset(ds, stations, hourly, *, variable)`
+### `merge_dataset(ds, stations, series, *, variable)`
 
 Fold a recent window into an **open** ts_ortho dataset (cfdb `Dataset` or `EDataset`, opened `flag='w'`).
-Appends genuinely-new stations and new hours, then does one contiguous read-modify-write over the
-affected block, writing incoming values **only where they are non-NaN** — so a station that is offline
-this window (or an hour that resamples to NaN) is never clobbered. Idempotent for a fixed input window.
-Returns a small report dict.
+The cadence is read back from the dataset's own envlib attrs and cross-checked against the stored
+axis (epoch-aligned origin, dense constant step — mismatches raise). Appends genuinely-new stations
+and new steps, then does one contiguous read-modify-write over the affected block, writing incoming
+values **only where they are non-NaN** — so a station that is offline this window (or an interval
+that resamples to NaN) is never clobbered. Idempotent for a fixed input window; a window entirely
+before the axis start raises (no history prepending). Returns a small report dict.
 
 ```python
 from cfdb import open_dataset
 from envlib_ingest_base import merge_dataset
 
 with open_dataset('flow.cfdb', flag='w') as ds:
-    merge_dataset(ds, stations, hourly_recent, variable='streamflow')
-    # -> {'new_stations': 0, 'new_hours': 24, 'written_block': 72}
+    merge_dataset(ds, stations, series_recent, variable='streamflow')
+    # -> {'new_stations': 0, 'new_steps': 24, 'written_block': 72, 'gap_steps': 0,
+    #     'qc_rejected': 0, 'dropped_before_axis': 0}
+    # gap_steps: steps left unfilled behind this window (pipeline downtime) — holes are NaN,
+    #            so refetching a wider window and re-merging heals them
+    # qc_rejected: values outside the encodable range set to NaN by the min/max QC
 ```
 
 ### `build_and_publish(...)` / `update_and_publish(...)` — publish to the commons
@@ -206,13 +278,13 @@ rcg = ebooklet.S3Connection(access_key_id=..., access_key=..., bucket=..., endpo
 cat = Catalogue(remotes=[rcg])
 
 # FIRST run: build the full backfill locally, push data, then write the catalogue entry
-build_and_publish(cat, 'flow.cfdb', member, rcg, meta, stations, hourly,
+build_and_publish(cat, 'flow.cfdb', member, rcg, meta, stations, series,
                   num_groups=17, variable='streamflow', units='m^3/s',
                   precision=4, min_value=0, max_value=100_000)
 
 # LATER runs: pull the remote, merge a recent window, push the diff, refresh the entry.
 # The remote is pulled each call, so `path` can be an ephemeral cache (stateless containers OK).
-update_and_publish(cat, 'flow.cfdb', member, rcg, stations, hourly_recent,
+update_and_publish(cat, 'flow.cfdb', member, rcg, stations, series_recent,
                    variable='streamflow', num_groups=17)
 ```
 

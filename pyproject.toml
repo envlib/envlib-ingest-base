@@ -14,7 +14,9 @@ dependencies = [
   # Deliberately pandas-free: the API is numpy tuples/dicts (pandas objects still
   # work as *inputs* by duck-typing).
   "envlib>=0.1.2",
-  "cfdb>=0.9.3",
+  # >=0.9.4 is a HARD floor: older cfdb fabricates values when its packed encoder meets
+  # NaN/out-of-range data (cfdb changelog 0.9.4); tsortho also enforces this at runtime.
+  "cfdb>=0.9.4",
   "ebooklet>=0.10.1",
   "numpy",
   "shapely>=2.0",
