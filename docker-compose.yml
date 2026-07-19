@@ -1,7 +1,14 @@
-# Records the published base-image tag (bump on each rebuild). Build: `docker compose build`.
-# Namespace is a placeholder - set to your Docker Hub namespace.
+# Build with the version derived from the package itself (single source of truth), AFTER
+# that version is on PyPI:
+#   TOOLKIT_VERSION=$(grep -oP "(?<=__version__ = ')[^']+" envlib_ingest_base/__init__.py) \
+#     docker compose build
+# The tag and the installed package can then never disagree; the version is REQUIRED
+# (no fallback — a bare `docker compose build` fails with the message below rather than
+# silently building a stale default). Namespace is a placeholder - set to your Docker Hub one.
 services:
   base:
-    image: mullenkamp/envlib-ingest-base:0.1
+    image: mullenkamp/envlib-ingest-base:${TOOLKIT_VERSION:?derive it from __init__.py - see the build command above}
     build:
       context: .
+      args:
+        TOOLKIT_VERSION: ${TOOLKIT_VERSION:?derive it from __init__.py - see the build command above}

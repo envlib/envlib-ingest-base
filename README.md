@@ -317,10 +317,15 @@ only in the dev group — fixtures pin the promise that pandas objects keep work
 ## Docker base image
 
 ```bash
-docker build -t <namespace>/envlib-ingest-base:<tag> .   # tag recorded in docker-compose.yml
+# run AFTER this version is on PyPI (export so compose sees it)
+export TOOLKIT_VERSION=$(sed -n "s/^__version__ = '\(.*\)'/\1/p" envlib_ingest_base/__init__.py)
+docker compose build
+docker compose push
 ```
 
-`requirements_base.txt` (scientific base) and `requirements_envlib.txt` (the envlib stack) are split
-so a stack bump doesn't invalidate the heavy base layer. The image keeps pandas for downstream fetch
-layers (CSV parsing) even though the toolkit itself doesn't need it. Downstream repos build `FROM`
-this image.
+The image installs the **released package from PyPI** (`TOOLKIT_VERSION` build arg) — the
+package's own pyproject is the single source of truth for dependencies, so there are no
+separately-maintained requirements files to drift out of sync (the cfdb >= 0.9.4 floor rides in
+via `requires_dist`). The image is pandas-free, like the toolkit: downstream repos build `FROM`
+this image and install their own extra runtime deps (e.g. the ECan repo adds pandas for its CSV
+fetch layer).

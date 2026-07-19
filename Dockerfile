@@ -1,20 +1,16 @@
-# Base image for the envlib ingest family: the envlib stack + this shared toolkit, pre-installed.
-# Downstream ingest repos build `FROM envlib-ingest-base:<tag>` and add only their source.
+# Base image for the envlib ingest family: the RELEASED toolkit + its full stack, straight
+# from PyPI — the package's own pyproject is the single source of truth for dependencies
+# (no separately-maintained requirements files to drift; the cfdb >= 0.9.4 encoder-fix
+# floor is enforced by the toolkit's requires_dist). Downstream ingest repos build
+# `FROM envlib-ingest-base:<tag>` and add only their source + their own extra deps.
 FROM python:3.12-slim
 
-RUN pip install --no-cache-dir -U pip
+# NO default on purpose: the version must always be passed explicitly (docker-compose.yml
+# derives it from envlib_ingest_base/__init__.py — see the build command there). A missing
+# or empty value fails loudly at the ${...:?} guard below instead of building a stale image.
+ARG TOOLKIT_VERSION
 
-# 1. slow-moving scientific base (own layer -> cached across stack bumps)
-COPY requirements_base.txt ./
-RUN pip install --no-cache-dir -r requirements_base.txt
-
-# 2. the envlib stack (faster-moving)
-COPY requirements_envlib.txt ./
-RUN pip install --no-cache-dir -r requirements_envlib.txt
-
-# 3. the toolkit itself (deps already satisfied above)
-COPY pyproject.toml README.md ./
-COPY envlib_ingest_base ./envlib_ingest_base
-RUN pip install --no-cache-dir --no-deps .
+RUN pip install --no-cache-dir -U pip && \
+    pip install --no-cache-dir "envlib-ingest-base==${TOOLKIT_VERSION:?pass the TOOLKIT_VERSION build-arg (see docker-compose.yml)}"
 
 CMD ["python"]

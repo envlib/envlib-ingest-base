@@ -1,6 +1,0 @@
-# Slow-moving scientific base (installed first for Docker layer caching).
-numpy
-pandas
-shapely>=2.0
-pyproj
-urllib3
