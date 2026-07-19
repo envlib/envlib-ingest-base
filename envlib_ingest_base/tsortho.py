@@ -422,17 +422,26 @@ def merge_dataset(ds, stations: dict, series: dict, *, variable: str):
     }
 
 
-def build_and_publish(cat, path, member_conn, rcg_conn, meta, stations, series, *, num_groups, **build_kwargs):
-    """First publish: build a local ts_ortho cfdb and publish it to the commons (data then RCG entry)."""
+def build_and_publish(cat, path, member_conn, rcg_conn, meta, stations, series, *, num_groups=None, **build_kwargs):
+    """First publish: build a local ts_ortho cfdb and publish it to the commons (data then RCG entry).
+
+    ``num_groups=None`` (default) stores each chunk as its own S3 object — the right choice
+    for continuously-updated ts_ortho datasets (small key counts, frequent single-chunk
+    updates: every push/pull moves exactly the changed data). Grouping is a request-batching
+    optimization for LARGE, rarely-updated archives (thousands of keys — see ebooklet's
+    guidance of 10-100MB per group); pass a prime ``num_groups`` only for that shape.
+    The choice is fixed at first publish.
+    """
     build_local(path, meta, stations, series, **build_kwargs)
     return cat.publish(str(path), member_conn, rcg_conn, num_groups=num_groups)
 
 
-def update_and_publish(cat, path, member_conn, rcg_conn, stations, series, *, variable, num_groups):
+def update_and_publish(cat, path, member_conn, rcg_conn, stations, series, *, variable, num_groups=None):
     """Incremental update: pull the remote, merge the recent window, then publish (diff + entry refresh).
 
     ``path`` is a local working cache linked to ``member_conn``; the merge reads only the coords +
-    the affected time block, so no full-remote materialization is required.
+    the affected time block, so no full-remote materialization is required. ``num_groups`` is
+    read from the remote for existing datasets (the first-publish choice wins) — leave it None.
     """
     with open_edataset(member_conn, str(path), flag='w', num_groups=num_groups) as ds:
         report = merge_dataset(ds, stations, series, variable=variable)

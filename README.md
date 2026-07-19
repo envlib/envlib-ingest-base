@@ -279,14 +279,21 @@ cat = Catalogue(remotes=[rcg])
 
 # FIRST run: build the full backfill locally, push data, then write the catalogue entry
 build_and_publish(cat, 'flow.cfdb', member, rcg, meta, stations, series,
-                  num_groups=17, variable='streamflow', units='m^3/s',
+                  variable='streamflow', units='m^3/s',
                   precision=4, min_value=0, max_value=100_000)
 
 # LATER runs: pull the remote, merge a recent window, push the diff, refresh the entry.
 # The remote is pulled each call, so `path` can be an ephemeral cache (stateless containers OK).
 update_and_publish(cat, 'flow.cfdb', member, rcg, stations, series_recent,
-                   variable='streamflow', num_groups=17)
+                   variable='streamflow')
 ```
+
+**Remote storage layout**: by default (`num_groups=None`) each chunk is its own S3 object —
+the right choice for continuously-updated ts_ortho datasets (tens of keys; every hourly
+push/pull moves exactly the changed chunk and nothing else). Grouped storage is a
+request-batching optimization for **large, rarely-updated archives** (thousands of keys —
+ebooklet's guidance is 10–100 MB per group); pass a prime `num_groups` at first publish only
+for that shape. The choice is fixed once the dataset is first pushed.
 
 `build_and_publish` takes the same keyword build args as `build_local`
 (`variable`/`units`/`precision`/`min_value`/`max_value`/`standard_name`/…); `update_and_publish` only
