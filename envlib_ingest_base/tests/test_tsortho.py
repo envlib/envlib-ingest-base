@@ -77,6 +77,8 @@ def test_build_and_validate(tmp_path):
             envlib.compute_station_id(shapely.Point(171.9, -43.1)),
         ]
         assert list(ds['station_id'].data) == expected_ids
+        # the source's native identifier (the stations-dict key) is persisted per station
+        assert list(ds['station_ref'].data) == ['A', 'B']
         np.testing.assert_allclose(np.asarray(ds['streamflow'][:].data)[0], [1, 2, 3, 4], rtol=1e-3)
 
     res = Catalogue(remotes=[], cache=str(tmp_path / 'cache')).validate(str(p))
@@ -143,6 +145,11 @@ def test_merge_new_station(tmp_path):
     with open_dataset(str(p)) as ds:
         assert ds['streamflow'].shape[0] == 2
         assert 'Charlie' in list(ds['station_name'].data)
+        # the appended station carries its ref, row-aligned with its name
+        names_ = list(ds['station_name'].data)
+        refs_ = list(ds['station_ref'].data)
+        assert refs_[names_.index('Charlie')] == 'C'
+        assert refs_[names_.index('Alpha')] == 'A'
         a = ds['streamflow'][:].data
     np.testing.assert_allclose(a[1, 2:4], [99, 98], rtol=1e-3)
 
@@ -287,7 +294,7 @@ def _build_legacy_us(path, meta, stations, series):
     t0 = min(int(t.astype('int64').min()) for t, _ in non.values())
     t1 = max(int(t.astype('int64').max()) for t, _ in non.values())
     times = np.arange(t0, t1 + 1, hour_us).astype('datetime64[us]')
-    points, ids, names = _points_ids_names(stations)
+    points, ids, names, _refs = _points_ids_names(stations)  # legacy shape: no station_ref var
     data = np.full((len(stations), times.size), np.nan)
     for i, ref in enumerate(stations):
         t, v = non[ref]

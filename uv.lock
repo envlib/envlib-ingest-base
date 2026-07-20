@@ -209,7 +209,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "cfdb", specifier = ">=0.9.4" },
-    { name = "ebooklet", specifier = ">=0.10.1" },
+    { name = "ebooklet", specifier = ">=0.10.2" },
     { name = "envlib", specifier = ">=0.1.2" },
     { name = "numpy" },
     { name = "shapely", specifier = ">=2.0" },

@@ -165,7 +165,19 @@ t, v = resample(times, values,
 Build and update envlib `ts_ortho` datasets — an orthogonal `(point, time)` layout: a geometry
 coordinate of shapely Points (one per station), a shared **dense fixed-step time axis at the
 cadence declared by `meta.frequency_interval`**, one data variable named after `meta.variable`,
-and `station_id` (envlib's deterministic hash) + `station_name` per station.
+and per-station metadata as auxiliary `(point,)` string variables — the established
+nomenclature for station data in envlib ts_ortho datasets:
+
+- `station_id` — envlib's deterministic *geometry* hash (`compute_station_id`); changes if the
+  provider corrects a site's coordinates.
+- `station_name` — the human-readable name.
+- `station_ref` — the **source's native identifier** (the stations-dict key, e.g. an ECan site
+  number): the stable join key back to the provider's own records.
+
+Future well-known station fields (e.g. `altitude`, where a source provides it) join the same
+pattern as `(point,)` variables with CF attrs. Note: `station_ref` exists in datasets built by
+toolkit >= 0.1.2; merging *new stations* into an older dataset raises (rebuild it), while
+revise-only merges keep working.
 
 **The envlib metadata is the single source of truth for the cadence** — there is no `freq`
 parameter. `frequency_interval` is a closed envlib vocabulary; only *fixed* codes work here

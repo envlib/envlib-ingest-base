@@ -3,8 +3,12 @@
 A ts_ortho dataset stores an orthogonal ``(point, time)`` layout: a geometry coordinate of
 shapely Points (one per station, order-free), a shared **dense fixed-step time axis at the
 cadence declared by ``meta.frequency_interval``**, one primary data variable named after
-``meta.variable``, and a ``station_id`` (envlib's deterministic hash) + ``station_name``
-attribute variable per station.
+``meta.variable``, and per-station metadata as auxiliary ``(point,)`` string variables —
+the established nomenclature for station data in envlib/cfdb ts_ortho datasets:
+``station_id`` (envlib's deterministic geometry hash), ``station_name``, and
+``station_ref`` (the SOURCE's native identifier = the stations-dict key, the stable join
+key back to the provider's records). Future well-known station fields (e.g. ``altitude``
+when a source provides it) join the same pattern as ``(point,)`` variables with CF attrs.
 
 **The envlib metadata is the single source of truth for the cadence** — there is no separate
 freq parameter. ``build_local`` reads ``meta.frequency_interval`` (a closed envlib controlled
@@ -81,6 +85,7 @@ def _require_fixed_cfdb() -> None:
 
 STATION_ID_VAR = 'station_id'
 STATION_NAME_VAR = 'station_name'
+STATION_REF_VAR = 'station_ref'
 _DEFAULT_TIME_CHUNK = 25_000  # steps; see the chunk_shape default rationale in build_local
 # natural-unit ladder: the largest unit that divides the step becomes the stored coord unit
 _UNIT_US = (('D', 86_400_000_000), ('h', 3_600_000_000), ('m', 60_000_000), ('s', 1_000_000))
@@ -233,7 +238,8 @@ def _points_ids_names(stations: dict):
     points = [shapely.Point(float(d['lon']), float(d['lat'])) for d in stations.values()]
     ids = np.array([envlib.compute_station_id(p) for p in points], dtype=object)
     names = np.array([str(d['name']) for d in stations.values()], dtype=object)
-    return points, ids, names
+    refs = np.array([str(r) for r in stations], dtype=object)
+    return points, ids, names, refs
 
 
 def build_local(
@@ -277,7 +283,7 @@ def build_local(
     tmax = _floor_step(max(int(t.astype('int64').max()) for t, _ in non_empty.values()), step_us)
     times_us = np.arange(tmin, tmax + 1, step_us)
     data = _assemble(stations, non_empty, tmin, times_us.size, step_us)
-    points, ids, names = _points_ids_names(stations)
+    points, ids, names, refs = _points_ids_names(stations)
 
     if chunk_shape is None:
         # ts_ortho default: point dim = 1 (ruling 2026-07-20). The dominant consumer read is
@@ -312,6 +318,11 @@ def build_local(
         sid[:] = ids
         snm = ds.create.data_var.generic(STATION_NAME_VAR, ('point',), dtype=dtypes.dtype('str'))
         snm[:] = names
+        # the SOURCE's native station identifier (the stations-dict key, e.g. an ECan site
+        # number) — the stable join key back to the provider's own records; station_id is
+        # geometry-derived and changes if the provider corrects coordinates
+        srf = ds.create.data_var.generic(STATION_REF_VAR, ('point',), dtype=dtypes.dtype('str'))
+        srf[:] = refs
 
         ds.attrs.update(attrs)
     return str(path)
@@ -371,7 +382,7 @@ def merge_dataset(ds, stations: dict, series: dict, *, variable: str):
     # --- new stations (only those that actually have data this window; `stations` may be the full
     #     discovery dict, but a station with no incoming data must never be added) ---
     active = list(non_empty)
-    points, ids, names = _points_ids_names({r: stations[r] for r in active})
+    points, ids, names, refs = _points_ids_names({r: stations[r] for r in active})
     id_to_row = {sid: i for i, sid in enumerate(cur_ids)}
     new_mask = np.array([sid not in id_to_row for sid in ids])
     n_new = int(new_mask.sum())
@@ -380,6 +391,7 @@ def merge_dataset(ds, stations: dict, series: dict, *, variable: str):
         base = len(cur_ids)
         ds[STATION_ID_VAR][base : base + n_new] = ids[new_mask]
         ds[STATION_NAME_VAR][base : base + n_new] = names[new_mask]
+        ds[STATION_REF_VAR][base : base + n_new] = refs[new_mask]
         for k, sid in enumerate(ids[new_mask]):
             id_to_row[sid] = base + k
 
