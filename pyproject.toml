@@ -17,7 +17,7 @@ dependencies = [
   # >=0.9.4 is a HARD floor: older cfdb fabricates values when its packed encoder meets
   # NaN/out-of-range data (cfdb changelog 0.9.4); tsortho also enforces this at runtime.
   "cfdb>=0.9.4",
-  "ebooklet>=0.10.1",
+  "ebooklet>=0.10.2",
   "numpy",
   "shapely>=2.0",
 ]
