@@ -81,6 +81,7 @@ def _require_fixed_cfdb() -> None:
 
 STATION_ID_VAR = 'station_id'
 STATION_NAME_VAR = 'station_name'
+_DEFAULT_TIME_CHUNK = 25_000  # steps; see the chunk_shape default rationale in build_local
 # natural-unit ladder: the largest unit that divides the step becomes the stored coord unit
 _UNIT_US = (('D', 86_400_000_000), ('h', 3_600_000_000), ('m', 60_000_000), ('s', 1_000_000))
 
@@ -279,8 +280,14 @@ def build_local(
     points, ids, names = _points_ids_names(stations)
 
     if chunk_shape is None:
-        tchunk = int(min(times_us.size, max(1, 2_000_000 // max(1, 2 * len(stations)))))
-        chunk_shape = (len(stations), tchunk)
+        # ts_ortho default: point dim = 1 (ruling 2026-07-20). The dominant consumer read is
+        # ONE station's history — an all-stations point chunk forces downloading the whole
+        # dataset to read one station (~250x amplification); one-station chunk columns also
+        # keep new-station appends and per-station updates independent. The time chunk trades
+        # object count vs per-chunk compression vs the perpetual per-update upload (each run
+        # rewrites every station's TAIL chunk): ~25k steps ≈ a handful of objects per station
+        # at ~50-200 KB each, a few MB of upload per update run.
+        chunk_shape = (1, int(min(times_us.size, _DEFAULT_TIME_CHUNK)))
 
     unit_us = dict(_UNIT_US).get(unit, 1)
     tvals = times_us.astype('datetime64[us]').astype(f'datetime64[{unit}]')
