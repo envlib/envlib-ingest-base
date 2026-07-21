@@ -165,19 +165,30 @@ t, v = resample(times, values,
 Build and update envlib `ts_ortho` datasets — an orthogonal `(point, time)` layout: a geometry
 coordinate of shapely Points (one per station), a shared **dense fixed-step time axis at the
 cadence declared by `meta.frequency_interval`**, one data variable named after `meta.variable`,
-and per-station metadata as auxiliary `(point,)` string variables — the established
-nomenclature for station data in envlib ts_ortho datasets:
+and per-station metadata as auxiliary `(point,)` variables — the established nomenclature for
+station data in envlib ts_ortho datasets:
 
 - `station_id` — envlib's deterministic *geometry* hash (`compute_station_id`); changes if the
-  provider corrects a site's coordinates.
+  provider corrects a site's coordinates. Carries the CF `cf_role = "timeseries_id"` marking it as
+  the timeseries instance identifier (cfdb writes the global `featureType = "timeSeries"`).
 - `station_name` — the human-readable name.
 - `station_ref` — the **source's native identifier** (the stations-dict key, e.g. an ECan site
   number): the stable join key back to the provider's own records.
+- `station_altitude` — station elevation in metres (CF `standard_name = "altitude"`). **Optional**:
+  created only when a source supplies a non-null `'altitude'` value in the stations dict (a source
+  with none, e.g. ECan — or one whose altitude column is all-null — gets no such variable); NaN for
+  any individual station lacking a value. Stored **as-reported** (unpacked float32, **no declared
+  precision** — survey accuracy varies station-to-station and isn't characterised), and QC'd against
+  a universal plausibility band (`valid_min = -500`, `valid_max = 9000` m, persisted as attrs);
+  out-of-range values (incl `-9999`-type sentinels, ±inf) become missing with a warning, while a
+  non-coercible value raises (that's an adapter bug, not a sentinel).
 
-Future well-known station fields (e.g. `altitude`, where a source provides it) join the same
-pattern as `(point,)` variables with CF attrs. Note: `station_ref` exists in datasets built by
-toolkit >= 0.1.2; merging *new stations* into an older dataset raises (rebuild it), while
-revise-only merges keep working.
+Each station var carries a CF `long_name` (and `station_id`/`station_ref` a `comment`); these
+back-fill onto pre-existing datasets on the next update run. Station metadata is **written once**,
+when a station first appears — it is not revised on later merges (correcting it needs a rebuild).
+Version notes: `station_ref` exists in datasets built by toolkit >= 0.1.2 (merging *new stations*
+into an older dataset raises — rebuild it — while revise-only merges keep working); the CF attrs
+and `station_altitude` land from toolkit >= 0.1.4.
 
 **The envlib metadata is the single source of truth for the cadence** — there is no `freq`
 parameter. `frequency_interval` is a closed envlib vocabulary; only *fixed* codes work here
@@ -201,8 +212,9 @@ axis widens back to midnight — normal numpy semantics, worth knowing as a read
 
 Two inputs recur:
 
-- **`stations`** — a dict `{ref: {'lon': float, 'lat': float, 'name': str}}`. From a pandas
-  frame indexed by ref with those columns: `df.to_dict('index')`.
+- **`stations`** — a dict `{ref: {'lon': float, 'lat': float, 'name': str[, 'altitude': float]}}`.
+  From a pandas frame indexed by ref with those columns: `df.to_dict('index')`. `altitude` is
+  optional (metres); include it and the `station_altitude` variable is created automatically.
 - **`series`** — a dict `{ref -> (times, values)}` of resampled tuples (the output of
   `resample_*` at the metadata's freq). Entries that are `None` or have `times.size == 0` are
   simply skipped.

@@ -3,12 +3,18 @@
 A ts_ortho dataset stores an orthogonal ``(point, time)`` layout: a geometry coordinate of
 shapely Points (one per station, order-free), a shared **dense fixed-step time axis at the
 cadence declared by ``meta.frequency_interval``**, one primary data variable named after
-``meta.variable``, and per-station metadata as auxiliary ``(point,)`` string variables —
-the established nomenclature for station data in envlib/cfdb ts_ortho datasets:
-``station_id`` (envlib's deterministic geometry hash), ``station_name``, and
-``station_ref`` (the SOURCE's native identifier = the stations-dict key, the stable join
-key back to the provider's records). Future well-known station fields (e.g. ``altitude``
-when a source provides it) join the same pattern as ``(point,)`` variables with CF attrs.
+``meta.variable``, and per-station metadata as auxiliary ``(point,)`` variables — the
+established nomenclature for station data in envlib/cfdb ts_ortho datasets:
+``station_id`` (envlib's deterministic geometry hash; carries the CF ``cf_role='timeseries_id'``
+that marks it as the timeseries instance identifier), ``station_name``, and ``station_ref`` (the
+SOURCE's native identifier = the stations-dict key, the stable join key back to the provider's
+records) — each carrying CF ``long_name``/``comment`` attrs. ``station_altitude`` (metres, CF
+``standard_name='altitude'``, unpacked float32) is added when — and only when — a source supplies
+a non-null ``'altitude'`` value in the stations dict; it is stored as-reported (no declared
+precision — survey accuracy varies station-to-station and is not characterised) and QC'd against a
+universal plausibility band (out-of-range values, incl -9999-type sentinels, become missing).
+Further well-known fields join the same ``(point,)`` pattern. Station metadata is written once,
+when a station first appears (not revised on later merges).
 
 **The envlib metadata is the single source of truth for the cadence** — there is no separate
 freq parameter. ``build_local`` reads ``meta.frequency_interval`` (a closed envlib controlled
@@ -22,8 +28,8 @@ by numpy to the axis unit (e.g. ``'...T06:00'`` on a daily axis widens back to m
 
 Two inputs recur:
 
-- ``stations``: a dict ``{ref: {'lon': float, 'lat': float, 'name': str}}`` (from a pandas
-  frame: ``df.to_dict('index')``).
+- ``stations``: a dict ``{ref: {'lon': float, 'lat': float, 'name': str[, 'altitude': float]}}``
+  (from a pandas frame: ``df.to_dict('index')``). ``altitude`` is optional (metres).
 - ``series``: a dict ``{ref -> (times, values)}`` of resampled tuples (the output of
   ``resample_*`` at the SAME freq the metadata declares): ascending interval-start
   ``datetime64`` times + ``float64`` values. An entry that is ``None`` or has
@@ -86,6 +92,53 @@ def _require_fixed_cfdb() -> None:
 STATION_ID_VAR = 'station_id'
 STATION_NAME_VAR = 'station_name'
 STATION_REF_VAR = 'station_ref'
+STATION_ALTITUDE_VAR = 'station_altitude'
+
+# station_altitude plausibility band (metres): a UNIVERSAL physical range for a station's
+# elevation — above every surface station on Earth (highest AWS ~8,810 m; Everest summit 8,849)
+# down through the deepest dry-land depressions (Dead Sea shore ~-430 m). Numeric values outside
+# it (incl ±inf, float32 overflow, and the classic -9999/-999 sentinels) are treated as MISSING,
+# not real. Precision is deliberately NOT declared: a station's survey accuracy varies
+# station-to-station, is rarely documented, and would be dishonest to assert — altitude is stored
+# as-reported (unpacked float32), and the comment attr says so.
+_ALTITUDE_MIN = -500.0
+_ALTITUDE_MAX = 9000.0
+_MAX_WARN_REFS = 10  # cap the station list shown in the out-of-range altitude warning
+
+# CF attributes for the auxiliary station-metadata variables. cfdb already writes the global
+# featureType='timeSeries' for ts_ortho; per CF discrete-sampling-geometry conventions (§9.5)
+# exactly one variable carries cf_role to mark the timeseries instance identifier — station_id
+# (envlib's canonical geometry-derived station identity). station_altitude is optional (created
+# only when a source supplies it; see build_local), so its attrs apply only where the var exists.
+_STATION_VAR_ATTRS = {
+    STATION_ID_VAR: {
+        'long_name': 'envlib station identifier',
+        'cf_role': 'timeseries_id',
+        'comment': (
+            'Deterministic hash of the station geometry (envlib.compute_station_id); envlib '
+            'canonical station identity. Changes if the source corrects the coordinates.'
+        ),
+    },
+    STATION_NAME_VAR: {'long_name': 'station name'},
+    STATION_REF_VAR: {
+        'long_name': 'source station reference identifier',
+        'comment': (
+            "The data provider's own native station id (the source's site key); the stable "
+            'join key back to the provider records.'
+        ),
+    },
+    STATION_ALTITUDE_VAR: {
+        'long_name': 'station altitude',
+        'standard_name': 'altitude',
+        'units': 'm',
+        'valid_min': _ALTITUDE_MIN,
+        'valid_max': _ALTITUDE_MAX,
+        'comment': (
+            'Station elevation as reported by the source; survey method and precision vary between '
+            'stations and are not characterised. Values outside the valid range are treated as missing.'
+        ),
+    },
+}
 _DEFAULT_TIME_CHUNK = 25_000  # steps; see the chunk_shape default rationale in build_local
 # natural-unit ladder: the largest unit that divides the step becomes the stored coord unit
 _UNIT_US = (('D', 86_400_000_000), ('h', 3_600_000_000), ('m', 60_000_000), ('s', 1_000_000))
@@ -242,6 +295,52 @@ def _points_ids_names(stations: dict):
     return points, ids, names, refs
 
 
+def _altitudes(stations: dict) -> np.ndarray:
+    """Per-station altitude in metres (unpacked float32), NaN where a station lacks one; order
+    matches the dict. A missing/None/NaN value -> NaN. A numeric value outside the plausibility
+    band ``[_ALTITUDE_MIN, _ALTITUDE_MAX]`` (incl ±inf, float32 overflow, and sentinels like
+    -9999) is treated as MISSING -> NaN with a station-naming warning — the same "the declared
+    range doubles as QC" rule the data var uses. A NON-coercible / wrong-type value RAISES naming
+    the station: that is an adapter bug (clean floats/None are expected), not a sensor sentinel."""
+    out, rejected = [], []
+    for ref, d in stations.items():
+        v = d.get('altitude')
+        if v is None:
+            out.append(np.nan)
+            continue
+        try:
+            f = float(v)
+        except (TypeError, ValueError) as e:
+            msg = f'station {ref!r}: invalid altitude {v!r}'
+            raise ValueError(msg) from e
+        if np.isnan(f):
+            out.append(np.nan)
+        elif _ALTITUDE_MIN <= f <= _ALTITUDE_MAX:
+            out.append(f)
+        else:  # sentinel / ±inf / float32 overflow -> missing (not real)
+            rejected.append(ref)
+            out.append(np.nan)
+    if rejected:
+        shown = rejected if len(rejected) <= _MAX_WARN_REFS else [*rejected[:_MAX_WARN_REFS], '...']
+        logger.warning(
+            'altitude: %d station(s) with out-of-range altitude set to NaN (outside [%g, %g] m): %s',
+            len(rejected),
+            _ALTITUDE_MIN,
+            _ALTITUDE_MAX,
+            shown,
+        )
+    return np.array(out, dtype='float32')
+
+
+def _apply_station_attrs(ds) -> None:
+    """Idempotently stamp the canonical CF attrs onto whatever station vars exist in ``ds``.
+    Unconditional ``update`` is safe: cfdb's attrs finalizer writes to the store only when the
+    attrs actually change, so re-running on every merge dirties nothing and re-uploads nothing."""
+    for var, attrs in _STATION_VAR_ATTRS.items():
+        if var in ds:
+            ds[var].attrs.update(attrs)
+
+
 def build_local(
     path,
     meta,
@@ -261,7 +360,9 @@ def build_local(
 
     The axis cadence comes from ``meta.frequency_interval`` (fixed CV codes only); the time
     coordinate is stored in the cadence's natural unit with an explicit step.
-    ``stations``: dict ``{ref: {'lon', 'lat', 'name'}}``; ``series``: ``{ref -> (times, values)}``.
+    ``stations``: dict ``{ref: {'lon', 'lat', 'name'[, 'altitude']}}`` (``altitude`` optional, metres —
+    the ``station_altitude`` var is created only if at least one station has it); ``series``:
+    ``{ref -> (times, values)}``.
     """
     _require_fixed_cfdb()
     step_us, unit = _freq_step(meta.frequency_interval)
@@ -324,6 +425,15 @@ def build_local(
         srf = ds.create.data_var.generic(STATION_REF_VAR, ('point',), dtype=dtypes.dtype('str'))
         srf[:] = refs
 
+        # optional station altitude: create the var only when the source actually supplies it (a
+        # source with none, e.g. ECan, gets no empty var); NaN for any station that lacks a value.
+        # Created after ds['point'].append so the auto chunk_shape sees a non-empty coord.
+        alts = _altitudes(stations)
+        if bool((~np.isnan(alts)).any()):
+            salt = ds.create.data_var.generic(STATION_ALTITUDE_VAR, ('point',), dtype=dtypes.dtype('float32'))
+            salt[:] = alts
+
+        _apply_station_attrs(ds)
         ds.attrs.update(attrs)
     return str(path)
 
@@ -336,6 +446,9 @@ def merge_dataset(ds, stations: dict, series: dict, *, variable: str):
     step). Appends new stations and new steps (in the coord's stored dtype), then does a single
     contiguous read-modify-write over the affected time block, keeping existing values where
     the incoming value is NaN. Idempotent for a fixed input window.
+
+    Requires a writable dataset: the station-attr heal runs on every call (even an empty window,
+    before the early return), so calling this on a read-only dataset raises rather than no-opping.
     """
     _require_fixed_cfdb()
     dsattrs = ds.attrs.data
@@ -345,6 +458,10 @@ def merge_dataset(ds, stations: dict, series: dict, *, variable: str):
     code = dsattrs['envlib_frequency_interval']
     step_us, _unit = _freq_step(code)
     _check_phase(dsattrs.get('envlib_utc_offset'), code)
+
+    # back-fill the canonical station-var CF attrs onto pre-existing datasets (idempotent, attrs
+    # only). Done here — before the empty-window early return — so even quiet update runs heal.
+    _apply_station_attrs(ds)
 
     non_empty = _non_empty(series)
     if not non_empty:
@@ -382,7 +499,12 @@ def merge_dataset(ds, stations: dict, series: dict, *, variable: str):
     # --- new stations (only those that actually have data this window; `stations` may be the full
     #     discovery dict, but a station with no incoming data must never be added) ---
     active = list(non_empty)
-    points, ids, names, refs = _points_ids_names({r: stations[r] for r in active})
+    sub = {r: stations[r] for r in active}
+    points, ids, names, refs = _points_ids_names(sub)
+    # validated up front, BEFORE any row mutation: a junk/non-finite altitude then raises
+    # pre-append (never leaving a half-written station row), and the check is uniform — merge
+    # is as loud on bad altitude as build, regardless of new-vs-existing or var presence.
+    alts = _altitudes(sub)
     id_to_row = {sid: i for i, sid in enumerate(cur_ids)}
     new_mask = np.array([sid not in id_to_row for sid in ids])
     n_new = int(new_mask.sum())
@@ -392,8 +514,19 @@ def merge_dataset(ds, stations: dict, series: dict, *, variable: str):
         ds[STATION_ID_VAR][base : base + n_new] = ids[new_mask]
         ds[STATION_NAME_VAR][base : base + n_new] = names[new_mask]
         ds[STATION_REF_VAR][base : base + n_new] = refs[new_mask]
+        if STATION_ALTITUDE_VAR in ds:
+            ds[STATION_ALTITUDE_VAR][base : base + n_new] = alts[new_mask]
         for k, sid in enumerate(ids[new_mask]):
             id_to_row[sid] = base + k
+    # incoming altitude with no var to hold it = silent omission until a rebuild. Warn once per
+    # merge, independent of n_new (a source may start supplying altitude for EXISTING stations).
+    # Station metadata is write-once: existing rows' altitude is not revised here (as with name/ref).
+    if STATION_ALTITUDE_VAR not in ds and bool((~np.isnan(alts)).any()):
+        logger.warning(
+            'merge %s: incoming stations carry altitude but the dataset has no %s var; rebuild to add it',
+            variable,
+            STATION_ALTITUDE_VAR,
+        )
 
     # --- new steps (extend the dense axis, in the coord's own stored dtype) ---
     inc_min = _floor_step(min(int(t.astype('int64').min()) for t, _ in non_empty.values()), step_us)

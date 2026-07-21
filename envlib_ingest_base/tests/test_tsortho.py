@@ -5,6 +5,9 @@ the natural-unit coord dtypes, the explicit step, the two phase-contract guards,
 cross-checks, and legacy-[us]-axis compatibility.
 """
 
+import hashlib
+import logging
+
 import cfdb as cfdb_module
 import envlib
 import numpy as np
@@ -13,7 +16,13 @@ import shapely
 from cfdb import dtypes, open_dataset
 from envlib import Catalogue
 
-from envlib_ingest_base.tsortho import _points_ids_names, build_local, merge_dataset
+from envlib_ingest_base.tsortho import (
+    STATION_ALTITUDE_VAR,
+    _altitudes,
+    _points_ids_names,
+    build_local,
+    merge_dataset,
+)
 
 BASE = np.datetime64('2020-01-01T00:00', 'us')
 HOUR = np.timedelta64(1, 'h')
@@ -471,3 +480,269 @@ def test_version_floor_refuses_broken_cfdb(tmp_path, monkeypatch):
     stns = stations_dict({'A': (172.5, -43.5, 'Alpha')})
     with pytest.raises(RuntimeError, match=r'cfdb >= 0\.9\.4 required'):
         build_local(tmp_path / 'x.cfdb', make_meta(), stns, _series({'A': [1.0, 2.0]}, n=2), **ENC)
+
+
+# --- station CF attrs + optional station_altitude ---
+
+
+def _alt_stations(spec):
+    """{ref: (lon, lat, name, altitude_or_None)} -> stations dict; the 'altitude' key is omitted
+    entirely when the altitude is None (mirrors a source that supplies the column for some sites)."""
+    out = {}
+    for ref, (lon, lat, name, alt) in spec.items():
+        d = {'lon': lon, 'lat': lat, 'name': name}
+        if alt is not None:
+            d['altitude'] = alt
+        out[ref] = d
+    return out
+
+
+def test_build_with_altitude(tmp_path):
+    stns = _alt_stations({'A': (172.5, -43.5, 'Alpha', 217.4), 'B': (171.9, -43.1, 'Bravo', None)})
+    p = tmp_path / 'sf.cfdb'
+    build_local(p, make_meta(), stns, _series({'A': [1.0, 2.0, 3.0, 4.0], 'B': [5.0, 6.0, 7.0, 8.0]}), **ENC)
+    with open_dataset(str(p)) as ds:
+        assert STATION_ALTITUDE_VAR in ds
+        alt = np.asarray(ds[STATION_ALTITUDE_VAR][:].data, dtype='float64')  # row order = dict order A,B
+        np.testing.assert_allclose(alt[0], 217.4, rtol=1e-4)
+        assert np.isnan(alt[1])  # B supplied no altitude
+        a = ds[STATION_ALTITUDE_VAR].attrs
+        assert a['standard_name'] == 'altitude'
+        assert a['units'] == 'm'
+        assert a['long_name'] == 'station altitude'
+        assert float(a['valid_min']) == -500.0 and float(a['valid_max']) == 9000.0
+        assert 'not characterised' in a['comment']  # honest "no precision declared" note
+        # the string station vars carry their CF attrs; station_id marks the timeseries instance
+        assert ds['station_id'].attrs['cf_role'] == 'timeseries_id'
+        assert ds['station_id'].attrs['long_name'] == 'envlib station identifier'
+        assert ds['station_name'].attrs['long_name'] == 'station name'
+        assert ds['station_ref'].attrs['long_name'] == 'source station reference identifier'
+        assert ds.attrs.data['featureType'] == 'timeSeries'  # cfdb writes this for ts_ortho
+    res = Catalogue(remotes=[], cache=str(tmp_path / 'c')).validate(str(p))
+    assert res['state']['dataset_type'] == 'ts_ortho'
+
+
+def test_build_without_altitude_no_var(tmp_path):
+    # ECan shape: no 'altitude' key anywhere -> no var created
+    p1 = tmp_path / 'ecan.cfdb'
+    build_local(p1, make_meta(), stations_dict(STNS_AB), _series({'A': [1.0, 2.0, 3.0, 4.0], 'B': [5, 6, 7, 8]}), **ENC)
+    with open_dataset(str(p1)) as ds:
+        assert STATION_ALTITUDE_VAR not in ds
+    # all-None altitudes: still no var (the trigger is any NON-null altitude, not the key's presence)
+    p2 = tmp_path / 'allnone.cfdb'
+    stns = _alt_stations({'A': (172.5, -43.5, 'Alpha', None), 'B': (171.9, -43.1, 'Bravo', None)})
+    build_local(p2, make_meta(), stns, _series({'A': [1.0, 2.0, 3.0, 4.0], 'B': [5, 6, 7, 8]}), **ENC)
+    with open_dataset(str(p2)) as ds:
+        assert STATION_ALTITUDE_VAR not in ds
+
+
+def test_build_altitude_zero_is_real(tmp_path):
+    # altitude 0.0 is a real datum-relative value, not "missing" -> var created, stores 0.0
+    stns = _alt_stations({'A': (172.5, -43.5, 'Alpha', 0.0)})
+    p = tmp_path / 'sf.cfdb'
+    build_local(p, make_meta(), stns, _series({'A': [1.0, 2.0, 3.0, 4.0]}), **ENC)
+    with open_dataset(str(p)) as ds:
+        assert STATION_ALTITUDE_VAR in ds
+        assert float(np.asarray(ds[STATION_ALTITUDE_VAR][:].data)[0]) == 0.0
+
+
+def test_merge_heals_attrs(tmp_path):
+    # _build_legacy_us writes station_id + station_name with NO attrs (and no station_ref/altitude)
+    stns = stations_dict({'A': (172.5, -43.5, 'Alpha')})
+    p = tmp_path / 'legacy.cfdb'
+    _build_legacy_us(p, make_meta(), stns, _series({'A': [1.0, 2.0, 3.0, 4.0]}))
+    with open_dataset(str(p)) as ds:
+        assert dict(ds['station_id'].attrs.data) == {}  # attr-less to start with
+    win = _series({'A': [3.0, 4.0]}, start=BASE + 2 * HOUR, n=2)
+    with open_dataset(str(p), flag='w') as ds:
+        merge_dataset(ds, stns, win, variable='streamflow')
+    with open_dataset(str(p)) as ds:
+        assert ds['station_id'].attrs['cf_role'] == 'timeseries_id'
+        assert ds['station_id'].attrs['long_name'] == 'envlib station identifier'
+        assert ds['station_name'].attrs['long_name'] == 'station name'
+        assert 'station_ref' not in ds  # absent vars are simply skipped, no error
+        first = dict(ds['station_id'].attrs.data)
+    # a second merge leaves the attrs identical (idempotent heal)
+    with open_dataset(str(p), flag='w') as ds:
+        merge_dataset(ds, stns, win, variable='streamflow')
+    with open_dataset(str(p)) as ds:
+        assert dict(ds['station_id'].attrs.data) == first
+
+
+def test_merge_new_station_altitude(tmp_path):
+    stns = _alt_stations({'A': (172.5, -43.5, 'Alpha', 100.0)})
+    p = tmp_path / 'sf.cfdb'
+    build_local(p, make_meta(), stns, _series({'A': [1.0, 2.0, 3.0, 4.0]}), **ENC)
+    # merge adds C (with altitude) and D (without); existing A must be untouched
+    stns2 = _alt_stations(
+        {
+            'A': (172.5, -43.5, 'Alpha', 100.0),
+            'C': (170.0, -44.0, 'Charlie', 555.5),
+            'D': (169.0, -43.0, 'Delta', None),
+        }
+    )
+    win = _series({'A': [3.0, 4.0], 'C': [9.0, 8.0], 'D': [1.0, 2.0]}, start=BASE + 2 * HOUR, n=2)
+    with open_dataset(str(p), flag='w') as ds:
+        r = merge_dataset(ds, stns2, win, variable='streamflow')
+    assert r['new_stations'] == 2
+    with open_dataset(str(p)) as ds:
+        names_ = list(ds['station_name'].data)
+        alt = np.asarray(ds[STATION_ALTITUDE_VAR][:].data, dtype='float64')  # point-aligned with names
+        assert alt[names_.index('Alpha')] == 100.0  # existing row untouched
+        np.testing.assert_allclose(alt[names_.index('Charlie')], 555.5, rtol=1e-4)
+        assert np.isnan(alt[names_.index('Delta')])  # new station lacking altitude -> NaN
+
+
+def test_merge_altitude_warning_when_var_missing(tmp_path, caplog):
+    # dataset built WITHOUT altitude; an EXISTING station later reports one (n_new == 0 path)
+    stns = stations_dict({'A': (172.5, -43.5, 'Alpha')})
+    p = tmp_path / 'sf.cfdb'
+    build_local(p, make_meta(), stns, _series({'A': [1.0, 2.0, 3.0, 4.0]}), **ENC)
+    stns2 = _alt_stations({'A': (172.5, -43.5, 'Alpha', 42.0)})
+    win = _series({'A': [3.0, 4.0]}, start=BASE + 2 * HOUR, n=2)
+    with caplog.at_level(logging.WARNING):
+        with open_dataset(str(p), flag='w') as ds:
+            r = merge_dataset(ds, stns2, win, variable='streamflow')
+    assert r['new_stations'] == 0
+    assert any('has no station_altitude var' in m for m in caplog.messages)
+    with open_dataset(str(p)) as ds:  # data merged despite the dropped altitude
+        assert STATION_ALTITUDE_VAR not in ds
+        np.testing.assert_allclose(ds['streamflow'][:].data[0], [1, 2, 3, 4], rtol=1e-3)
+
+
+def test_altitudes_conversion(caplog):
+    stns = {
+        'A': {'lon': 0, 'lat': 0, 'name': 'a', 'altitude': 12.5},
+        'B': {'lon': 0, 'lat': 0, 'name': 'b'},  # absent -> NaN
+        'C': {'lon': 0, 'lat': 0, 'name': 'c', 'altitude': None},  # None -> NaN
+        'D': {'lon': 0, 'lat': 0, 'name': 'd', 'altitude': np.nan},  # NaN -> NaN
+        'E': {'lon': 0, 'lat': 0, 'name': 'e', 'altitude': '123.4'},  # str coerces
+        'F': {'lon': 0, 'lat': 0, 'name': 'f', 'altitude': 217},  # int coerces
+    }
+    alt = _altitudes(stns)
+    assert alt.dtype == np.float32
+    np.testing.assert_allclose(alt[0], 12.5, rtol=1e-4)
+    assert np.isnan(alt[1]) and np.isnan(alt[2]) and np.isnan(alt[3])
+    np.testing.assert_allclose(alt[4], 123.4, rtol=1e-4)
+    np.testing.assert_allclose(alt[5], 217.0, rtol=1e-4)
+
+    # numeric-but-out-of-band (sentinel / ±inf / float32 overflow) -> MISSING (NaN) + named warning,
+    # NOT a raise: the declared range doubles as QC, exactly like the data variable.
+    with caplog.at_level(logging.WARNING):
+        bad = _altitudes(
+            {
+                'G': {'lon': 0, 'lat': 0, 'name': 'g', 'altitude': -9999.0},  # sentinel
+                'H': {'lon': 0, 'lat': 0, 'name': 'h', 'altitude': np.inf},
+                'I': {'lon': 0, 'lat': 0, 'name': 'i', 'altitude': 1e39},  # overflows float32
+                'J': {'lon': 0, 'lat': 0, 'name': 'j', 'altitude': 250.0},  # in band
+            }
+        )
+    assert np.isnan(bad[0]) and np.isnan(bad[1]) and np.isnan(bad[2])
+    np.testing.assert_allclose(bad[3], 250.0, rtol=1e-4)
+    assert any('out-of-range altitude' in m for m in caplog.messages)
+
+    # a non-coercible / wrong-type value is an adapter bug -> raises, naming the station
+    with pytest.raises(ValueError, match=r"station 'X': invalid altitude"):
+        _altitudes({'X': {'lon': 0, 'lat': 0, 'name': 'x', 'altitude': 'n/a'}})
+
+
+def test_merge_heals_on_empty_window(tmp_path):
+    stns = stations_dict({'A': (172.5, -43.5, 'Alpha')})
+    p = tmp_path / 'legacy.cfdb'
+    _build_legacy_us(p, make_meta(), stns, _series({'A': [1.0, 2.0, 3.0, 4.0]}))
+    with open_dataset(str(p), flag='w') as ds:  # empty series -> zero report, but attrs still heal
+        r = merge_dataset(ds, stns, {}, variable='streamflow')
+    assert r == {
+        'new_stations': 0,
+        'new_steps': 0,
+        'written_block': 0,
+        'gap_steps': 0,
+        'qc_rejected': 0,
+        'dropped_before_axis': 0,
+    }
+    with open_dataset(str(p)) as ds:
+        assert ds['station_id'].attrs['cf_role'] == 'timeseries_id'
+
+
+def test_merge_bad_altitude_raises_before_mutating(tmp_path):
+    # a NON-COERCIBLE altitude (adapter bug) must raise BEFORE any row is appended — never leave a
+    # half-written station whose altitude is then NaN forever (write-once). Numeric out-of-band
+    # values are handled as missing instead (see test_altitude_out_of_range_becomes_nan).
+    stns = _alt_stations({'A': (172.5, -43.5, 'Alpha', 100.0)})
+    p = tmp_path / 'sf.cfdb'
+    build_local(p, make_meta(), stns, _series({'A': [1.0, 2.0, 3.0, 4.0]}), **ENC)
+    with open_dataset(str(p)) as ds:
+        before = ds['point'].shape[0]
+
+    # new station E carries a non-coercible altitude -> must raise, and E must NOT be appended
+    stns2 = _alt_stations({'A': (172.5, -43.5, 'Alpha', 100.0), 'E': (168.0, -45.0, 'Echo', None)})
+    stns2['E']['altitude'] = 'n/a'
+    win = _series({'A': [3.0, 4.0], 'E': [1.0, 2.0]}, start=BASE + 2 * HOUR, n=2)
+    with pytest.raises(ValueError, match=r"station 'E': invalid altitude"):
+        with open_dataset(str(p), flag='w') as ds:
+            merge_dataset(ds, stns2, win, variable='streamflow')
+    with open_dataset(str(p)) as ds:
+        assert ds['point'].shape[0] == before  # no zombie row left behind
+        assert 'Echo' not in list(ds['station_name'].data)
+
+    # same loudness on a non-coercible value when the dataset has NO altitude var
+    p2 = tmp_path / 'noalt.cfdb'
+    build_local(p2, make_meta(), stations_dict({'A': (172.5, -43.5, 'Alpha')}), _series({'A': [1.0, 2.0]}, n=2), **ENC)
+    bad = {'A': {'lon': 172.5, 'lat': -43.5, 'name': 'Alpha', 'altitude': 'xyz'}}
+    with pytest.raises(ValueError, match=r"station 'A': invalid altitude"):
+        with open_dataset(str(p2), flag='w') as ds:
+            merge_dataset(ds, bad, _series({'A': [3.0, 4.0]}, start=BASE + 1 * HOUR, n=2), variable='streamflow')
+
+
+def test_heal_rerun_is_upload_clean(tmp_path):
+    # the "re-running the heal re-uploads nothing" claim: after the first heal stamps the attrs,
+    # a second empty-window merge must leave the file BYTE-identical (cfdb's attrs finalizer only
+    # writes on real change). A future cfdb regression that re-writes unchanged attrs breaks this.
+    stns = stations_dict({'A': (172.5, -43.5, 'Alpha')})
+    p = tmp_path / 'legacy.cfdb'
+    _build_legacy_us(p, make_meta(), stns, _series({'A': [1.0, 2.0, 3.0, 4.0]}))  # attr-less to start
+
+    def _sha():
+        return hashlib.sha256(p.read_bytes()).hexdigest()
+
+    with open_dataset(str(p), flag='w') as ds:  # first heal writes the attrs
+        merge_dataset(ds, stns, {}, variable='streamflow')
+    h1 = _sha()
+    with open_dataset(str(p), flag='w') as ds:  # re-run must not touch a byte
+        merge_dataset(ds, stns, {}, variable='streamflow')
+    assert _sha() == h1
+
+
+def test_altitude_out_of_range_becomes_nan(tmp_path, caplog):
+    # a sentinel altitude (-9999) is treated as MISSING (NaN) at build, the in-band station is kept,
+    # a warning is logged, and the band is persisted as valid_min/valid_max attrs. Then a merge with
+    # an out-of-band new-station altitude lands NaN too (missing, not a raise).
+    stns = _alt_stations({'A': (172.5, -43.5, 'Alpha', 250.0), 'B': (171.9, -43.1, 'Bravo', -9999.0)})
+    p = tmp_path / 'sf.cfdb'
+    with caplog.at_level(logging.WARNING):
+        build_local(p, make_meta(), stns, _series({'A': [1.0, 2, 3, 4], 'B': [5.0, 6, 7, 8]}), **ENC)
+    assert any('out-of-range altitude' in m for m in caplog.messages)
+    with open_dataset(str(p)) as ds:
+        names_ = list(ds['station_name'].data)
+        alt = np.asarray(ds[STATION_ALTITUDE_VAR][:].data, dtype='float64')
+        np.testing.assert_allclose(alt[names_.index('Alpha')], 250.0, rtol=1e-4)
+        assert np.isnan(alt[names_.index('Bravo')])  # sentinel -> missing
+        a = ds[STATION_ALTITUDE_VAR].attrs
+        assert float(a['valid_min']) == -500.0 and float(a['valid_max']) == 9000.0
+
+    # merge a NEW station whose altitude is out of band -> stored NaN (missing), no raise
+    stns2 = _alt_stations(
+        {
+            'A': (172.5, -43.5, 'Alpha', 250.0),
+            'B': (171.9, -43.1, 'Bravo', -9999.0),
+            'C': (170.0, -44.0, 'Charlie', 1e39),  # overflows float32 -> missing
+        }
+    )
+    win = _series({'A': [3.0, 4.0], 'B': [5.0, 6.0], 'C': [7.0, 8.0]}, start=BASE + 2 * HOUR, n=2)
+    with open_dataset(str(p), flag='w') as ds:
+        r = merge_dataset(ds, stns2, win, variable='streamflow')
+    assert r['new_stations'] == 1
+    with open_dataset(str(p)) as ds:
+        names_ = list(ds['station_name'].data)
+        alt = np.asarray(ds[STATION_ALTITUDE_VAR][:].data, dtype='float64')
+        assert np.isnan(alt[names_.index('Charlie')])  # out-of-band new station -> missing
