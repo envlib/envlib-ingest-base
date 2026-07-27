@@ -151,7 +151,7 @@ wheels = [
 
 [[package]]
 name = "ebooklet"
-version = "0.10.2"
+version = "0.10.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "booklet" },
@@ -160,14 +160,14 @@ dependencies = [
     { name = "s3func" },
     { name = "urllib3" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/c7/91/f496ad845e119dfbf6f78f651ffb2cde7453157a9b6095fdb2532ca73666/ebooklet-0.10.2.tar.gz", hash = "sha256:0ea4d6de736644fe2d3a5a3f40ea3df240c4d9a3a327bd1efb1088261d935814", size = 64198, upload-time = "2026-07-20T02:11:06.459Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/31/d4/a61ceaf331393f88e24d0215c97e135e3934fe096579061481af09c12b15/ebooklet-0.10.3.tar.gz", hash = "sha256:cc0ecad0a024d3af0b751a8d58c34d38c493cfc88247526c67145df808d285ef", size = 65169, upload-time = "2026-07-23T00:01:36.437Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/53/d6/80102d21d18c8c37b3b3488fca19a5c18fe7fc2ba52b415ccbd813300949/ebooklet-0.10.2-py3-none-any.whl", hash = "sha256:105df0bbf93a42fb1fb6bed46efe4fc8e2061e407140871338aeac13f17e04d6", size = 67461, upload-time = "2026-07-20T02:11:04.934Z" },
+    { url = "https://files.pythonhosted.org/packages/0b/07/df4671dfab7387554346dfc966ad0720d4f5165d758e26c3e6195410ee1b/ebooklet-0.10.3-py3-none-any.whl", hash = "sha256:f807e889719f1c77b870b7276b618c0f4939145830fde3837b9c00a7ae99c5fe", size = 68500, upload-time = "2026-07-23T00:01:34.73Z" },
 ]
 
 [[package]]
 name = "envlib"
-version = "0.1.2"
+version = "0.1.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "booklet" },
@@ -178,9 +178,9 @@ dependencies = [
     { name = "shapely" },
     { name = "urllib3" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/91/a5/8b578ea728766bbf20dcee624252052e3b6c04f0f02c6ee5638e09a06c8b/envlib-0.1.2.tar.gz", hash = "sha256:111f92f5601860ff04ce55fbda8e0af4901095b0a6bee4a3710ef28ce0187cbc", size = 83585, upload-time = "2026-07-13T08:19:07.618Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/08/b0/2ec5e1a9e9db5d9b5a6d4c56efa7605f16ad234cd4be1768356150322d46/envlib-0.1.3.tar.gz", hash = "sha256:217729bb3dbc77ba1c38793e4b7fb5be2eea396cb37aa41bb853db216ec515a4", size = 84556, upload-time = "2026-07-24T21:19:11.717Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/ac/e3/ea6b173c3524fb796f1b0286bafd66bd155cb1416691b1fbb3f089835a67/envlib-0.1.2-py3-none-any.whl", hash = "sha256:6dbd2abf794401846c7318437af793424af02eb33622565f5809100f977539e7", size = 87018, upload-time = "2026-07-13T08:19:05.8Z" },
+    { url = "https://files.pythonhosted.org/packages/c1/9e/7d85a8263c101c2781e7bde12ea29cad8f11b6be5a3f3263d297a783e942/envlib-0.1.3-py3-none-any.whl", hash = "sha256:7b7aeefa7f48f0a6ad88421a3518bd3683585c54549c1725dedb4663fcc8e61f", size = 88057, upload-time = "2026-07-24T21:19:10.24Z" },
 ]
 
 [[package]]
@@ -209,7 +209,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "cfdb", specifier = ">=0.9.4" },
-    { name = "ebooklet", specifier = ">=0.10.2" },
+    { name = "ebooklet", specifier = ">=0.10.3" },
     { name = "envlib", specifier = ">=0.1.2" },
     { name = "numpy" },
     { name = "shapely", specifier = ">=2.0" },

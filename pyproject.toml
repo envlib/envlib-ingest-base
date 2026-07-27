@@ -13,11 +13,11 @@ dependencies = [
   # Released PyPI stack only - ingest repos are arm's-length consumers.
   # Deliberately pandas-free: the API is numpy tuples/dicts (pandas objects still
   # work as *inputs* by duck-typing).
-  "envlib>=0.1.2",
+  "envlib>=0.1.3",
   # >=0.9.4 is a HARD floor: older cfdb fabricates values when its packed encoder meets
   # NaN/out-of-range data (cfdb changelog 0.9.4); tsortho also enforces this at runtime.
   "cfdb>=0.9.4",
-  "ebooklet>=0.10.2",
+  "ebooklet>=0.10.3",
   "numpy",
   "shapely>=2.0",
 ]
