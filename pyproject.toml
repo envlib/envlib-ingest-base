@@ -20,6 +20,7 @@ dependencies = [
   "ebooklet>=0.10.3",
   "numpy",
   "shapely>=2.0",
+  "sentry-sdk",
 ]
 
 [dependency-groups]
