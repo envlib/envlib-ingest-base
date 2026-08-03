@@ -34,6 +34,17 @@ Two inputs recur:
   ``resample_*`` at the SAME freq the metadata declares): ascending interval-start
   ``datetime64`` times + ``float64`` values. An entry that is ``None`` or has
   ``times.size == 0`` is simply skipped — never test the tuple itself with ``len()``/truthiness.
+  An entry may instead be the 3-tuple ``(times, values, extras)``, where ``extras`` is
+  ``{ancillary_name: array}`` positionally paired with ``values`` — see below.
+
+Optionally a dataset carries **ancillary variables**: companion ``(point, time)`` planes holding
+per-timestep metadata about each value, declared via ``build_local(..., ancillary=...)`` and named
+on the primary by the CF ``ancillary_variables`` attr. The motivating case is a per-observation
+quality grade (e.g. NEMS) on a quality-controlled product. They are stored as packed floats rather
+than integers because the whole merge/QC machinery is NaN-based, and they are governed on update by
+a single union mask so a stored (value, grade) pair always comes from one run (see
+``merge_dataset``). There is deliberately NO deletion path: the merge cannot express "this reading
+is now missing", which is what protects an offline station's history from being erased.
 
 Two guards enforce a strict **epoch-anchored phase contract** (phase-anchored binning — e.g. a
 local-midnight or 9am-rain-day daily product — is deliberately unsupported until the resampler
@@ -140,6 +151,8 @@ _STATION_VAR_ATTRS = {
     },
 }
 _DEFAULT_TIME_CHUNK = 25_000  # steps; see the chunk_shape default rationale in build_local
+# a series entry is (times, values) or (times, values, extras) — the 3rd slot carries ancillary data
+_SERIES_WITH_EXTRAS = 3
 # natural-unit ladder: the largest unit that divides the step becomes the stored coord unit
 _UNIT_US = (('D', 86_400_000_000), ('h', 3_600_000_000), ('m', 60_000_000), ('s', 1_000_000))
 
@@ -179,7 +192,7 @@ def _step_index(times, t0_us: int, step_us: int) -> np.ndarray:
 
 def _check_aligned(non_empty: dict, step_us: int, code) -> None:
     """Every incoming timestamp must sit on the epoch-anchored step grid (module docstring)."""
-    for ref, (t, _v) in non_empty.items():
+    for ref, (t, *_rest) in non_empty.items():
         res = t.astype('int64') % step_us
         bad = np.nonzero(res)[0]
         if bad.size:
@@ -222,20 +235,37 @@ def _encodable_range(dt) -> tuple:
     return (1 / factor) + dt.offset, (info.max / factor) + dt.offset
 
 
-def _qc_filter(non_empty: dict, lo, hi) -> tuple[dict, int]:
+def _qc_filter(non_empty: dict, lo, hi, anc_bounds: dict | None = None) -> tuple[dict, int, int]:
     """min/max QC (ruling 2026-07-17): the DECLARED min/max double as plausibility bounds,
     so values outside them — including ±inf — become NaN (missing). Runs BEFORE the merge
-    combine, so a rejected incoming value can never displace a stored valid one."""
-    if lo is None:
-        return non_empty, 0
-    out, n = {}, 0
-    for ref, (t, v) in non_empty.items():
-        bad = ~np.isnan(v) & ((v < lo) | (v > hi))
+    combine, so a rejected incoming value can never displace a stored valid one.
+
+    Ancillary planes are filtered against their OWN declared bounds, and a value rejected by
+    the PRIMARY filter takes its ancillary entries with it: a quality grade attached to a
+    measurement we refused to store describes nothing.
+    """
+    anc_bounds = anc_bounds or {}
+    out, n, n_anc = {}, 0, 0
+    for ref, (t, v, ex) in non_empty.items():
+        if lo is None:
+            bad = np.zeros(v.shape, dtype=bool)
+        else:
+            bad = ~np.isnan(v) & ((v < lo) | (v > hi))
         nbad = int(bad.sum())
         vv = np.where(bad, np.nan, v) if nbad else v
         n += nbad
-        out[ref] = (t, vv)
-    return out, n
+        ee = {}
+        for k, a in ex.items():
+            b = anc_bounds.get(k)
+            if b is None or b[0] is None:
+                abad = np.zeros(a.shape, dtype=bool)
+            else:
+                abad = ~np.isnan(a) & ((a < b[0]) | (a > b[1]))
+            n_anc += int(abad.sum())
+            drop = abad | bad
+            ee[k] = np.where(drop, np.nan, a) if drop.any() else a
+        out[ref] = (t, vv, ee)
+    return out, n, n_anc
 
 
 def _qc_bounds(dv) -> tuple:
@@ -261,29 +291,77 @@ def _nan_safe(data: np.ndarray, dt) -> np.ndarray:
 
 
 def _non_empty(series: dict) -> dict:
-    """Entries that actually carry data, normalized to (datetime64[us] times, float64 values)."""
+    """Entries that actually carry data, normalized to ``(times, values, extras)``.
+
+    Accepts both the 2-tuple ``(times, values)`` and the 3-tuple ``(times, values, extras)``
+    where ``extras`` is ``{ancillary_name: array}`` **positionally paired with values** — same
+    length, same timestamps. The pairing is structural precisely so a value and its ancillary
+    entry can never desynchronize; a ragged extras array is a producer bug and raises here,
+    before anything is written.
+    """
     out = {}
     for ref, s in series.items():
         if s is None:
             continue
-        t, v = s
+        if len(s) == _SERIES_WITH_EXTRAS:
+            t, v, extras = s
+        else:
+            t, v = s
+            extras = None
         t = np.asarray(t, dtype='datetime64[us]')
+        v = np.asarray(v, dtype='float64')
+        ex = {}
+        for k, arr in (extras or {}).items():
+            a = np.asarray(arr, dtype='float64')
+            if a.shape != v.shape:
+                msg = (
+                    f'station {ref!r}: ancillary {k!r} has shape {a.shape} but values have '
+                    f'{v.shape} — extras must be positionally paired with values'
+                )
+                raise ValueError(msg)
+            ex[k] = a
         if t.size:
-            out[ref] = (t, np.asarray(v, dtype='float64'))
+            out[ref] = (t, v, ex)
     return out
 
 
-def _assemble(stations: dict, series: dict, t0_us: int, n_times: int, step_us: int) -> np.ndarray:
-    """Dense (n_point, n_time) float array; NaN where a station has no value at a step."""
+def _check_extras(non_empty: dict, roster) -> None:
+    """Incoming ancillary data naming a variable the dataset does not declare RAISES.
+
+    Deliberately louder than the altitude warn-and-continue: silently dropping per-timestep
+    quality information from a QC'd product is data loss with no later recovery path (there is
+    no rebuild that puts it back without re-running the whole extraction).
+    """
+    known = set(roster)
+    for ref, (_t, _v, ex) in non_empty.items():
+        unknown = sorted(set(ex) - known)
+        if unknown:
+            msg = (
+                f'station {ref!r}: ancillary {unknown} not declared by this dataset '
+                f'(declared: {sorted(known)})'
+            )
+            raise ValueError(msg)
+
+
+def _assemble(stations: dict, series: dict, t0_us: int, n_times: int, step_us: int, plane=None) -> np.ndarray:
+    """Dense (n_point, n_time) float array; NaN where a station has no value at a step.
+
+    ``plane=None`` assembles the primary values; a string assembles that named ancillary
+    (stations lacking it stay NaN), so both planes share this one code path and land on
+    identical geometry.
+    """
     data = np.full((len(stations), n_times), np.nan, dtype='float64')
     for i, ref in enumerate(stations):
         s = series.get(ref)
         if s is None:
             continue
-        t, v = s
+        t, v, ex = s
+        arr = v if plane is None else ex.get(plane)
+        if arr is None:
+            continue
         col = _step_index(t, t0_us, step_us)
         ok = (col >= 0) & (col < n_times)
-        data[i, col[ok]] = v[ok]
+        data[i, col[ok]] = arr[ok]
     return data
 
 
@@ -355,6 +433,7 @@ def build_local(
     chunk_shape=None,
     standard_name=None,
     extra_var_attrs=None,
+    ancillary=None,
 ):
     """Create a fresh local ts_ortho cfdb from all stations + their resampled series.
 
@@ -362,26 +441,51 @@ def build_local(
     coordinate is stored in the cadence's natural unit with an explicit step.
     ``stations``: dict ``{ref: {'lon', 'lat', 'name'[, 'altitude']}}`` (``altitude`` optional, metres —
     the ``station_altitude`` var is created only if at least one station has it); ``series``:
-    ``{ref -> (times, values)}``.
+    ``{ref -> (times, values)}`` or ``{ref -> (times, values, extras)}``.
+
+    ``ancillary`` declares optional companion ``(point, time)`` variables carrying per-timestep
+    metadata about each value — a NEMS/quality grade being the motivating case::
+
+        ancillary={'quality_code': {'units': '1', 'precision': 0,
+                                    'min_value': 0, 'max_value': 1000,
+                                    'attrs': {'standard_name': 'quality_flag', ...}}}
+
+    Their data arrives in each series entry's ``extras`` dict. The primary variable gets a CF
+    ``ancillary_variables`` attr naming them, which is also the roster ``merge_dataset`` reads
+    back — the stored dataset, not a caller argument, is the single source of truth on update.
+
+    Each ancillary is stored as a PACKED FLOAT (not an integer dtype): the whole merge/QC
+    machinery is NaN-based, and an integer plane cannot express "no incoming code" at all.
+    ``valid_min``/``valid_max`` are written from the declared bounds and are load-bearing, not
+    decorative — the encoder rejects below-min and non-finite but passes ABOVE-max values
+    straight through, so without those attrs a merge falls back to the far wider encodable
+    range and a junk high code would persist silently.
     """
     _require_fixed_cfdb()
     step_us, unit = _freq_step(meta.frequency_interval)
     attrs = meta.to_dict()
     _check_phase(attrs.get('envlib_utc_offset'), meta.frequency_interval)
+    ancillary = ancillary or {}
     non_empty = _non_empty(series)
     if not non_empty:
         msg = 'no series data to build from'
         raise ValueError(msg)
     _check_refs(non_empty, stations)
+    _check_extras(non_empty, ancillary)
     _check_aligned(non_empty, step_us, meta.frequency_interval)
 
     dt = dtypes.dtype('float32', precision=precision, min_value=min_value, max_value=max_value)
-    non_empty, n_qc = _qc_filter(non_empty, float(min_value), float(max_value))
+    anc_bounds = {k: (float(s['min_value']), float(s['max_value'])) for k, s in ancillary.items()}
+    non_empty, n_qc, n_anc_qc = _qc_filter(non_empty, float(min_value), float(max_value), anc_bounds)
     if n_qc:
         logger.warning('build %s: %d value(s) outside [%s, %s] set to NaN (QC)', variable, n_qc, min_value, max_value)
+    if n_anc_qc:
+        logger.warning(
+            'build %s: %d ancillary value(s) outside their declared bounds set to NaN (QC)', variable, n_anc_qc
+        )
 
-    tmin = _floor_step(min(int(t.astype('int64').min()) for t, _ in non_empty.values()), step_us)
-    tmax = _floor_step(max(int(t.astype('int64').max()) for t, _ in non_empty.values()), step_us)
+    tmin = _floor_step(min(int(t.astype('int64').min()) for t, *_ in non_empty.values()), step_us)
+    tmax = _floor_step(max(int(t.astype('int64').max()) for t, *_ in non_empty.values()), step_us)
     times_us = np.arange(tmin, tmax + 1, step_us)
     data = _assemble(stations, non_empty, tmin, times_us.size, step_us)
     points, ids, names, refs = _points_ids_names(stations)
@@ -413,7 +517,29 @@ def build_local(
             dv.attrs['standard_name'] = standard_name
         if extra_var_attrs:
             dv.attrs.update(extra_var_attrs)
+        # CF: name the companion variables on the primary. This attr is also the roster
+        # merge_dataset reads back, so the stored dataset stays the source of truth on update.
+        if ancillary:
+            dv.attrs['ancillary_variables'] = ' '.join(ancillary)
         dv[:] = _nan_safe(data, dt)
+
+        for aname, spec in ancillary.items():
+            adt = dtypes.dtype(
+                'float32',
+                precision=spec['precision'],
+                min_value=spec['min_value'],
+                max_value=spec['max_value'],
+            )
+            av = ds.create.data_var.generic(aname, ('point', 'time'), dtype=adt, chunk_shape=chunk_shape)
+            av.attrs['units'] = spec.get('units', '1')
+            if spec.get('attrs'):
+                av.attrs.update(spec['attrs'])
+            # written LAST so a caller-supplied attrs dict can never weaken the QC bounds
+            av.attrs['valid_min'] = float(spec['min_value'])
+            av.attrs['valid_max'] = float(spec['max_value'])
+            av[:] = _nan_safe(
+                _assemble(stations, non_empty, tmin, times_us.size, step_us, plane=aname), adt
+            )
 
         sid = ds.create.data_var.generic(STATION_ID_VAR, ('point',), dtype=dtypes.dtype('str'))
         sid[:] = ids
@@ -449,6 +575,25 @@ def merge_dataset(ds, stations: dict, series: dict, *, variable: str):
 
     Requires a writable dataset: the station-attr heal runs on every call (even an empty window,
     before the early return), so calling this on a read-only dataset raises rather than no-opping.
+
+    **Ancillary variables.** The roster is read from the primary's ``ancillary_variables`` attr
+    (never a caller argument), and the write is governed by a single UNION mask: a slot counts as
+    "supplied by this run" when the primary OR any ancillary is non-NaN there, and every plane is
+    then taken from that run. Two properties follow. A stored (value, code) pair always originates
+    from one run — a later run can never leave its value sitting beside an earlier run's grade. And
+    a grade can exist without a value, so a code whose entire job is to explain an absence (NEMS
+    100, "missing record") is representable rather than silently dropped.
+
+    Note the deliberate asymmetry with deletion: an all-NaN incoming slot leaves the stored pair
+    untouched, which is what stops a briefly-offline station from erasing good history — and is
+    also why this merge cannot express a genuine retraction. A source that revises a reading *to*
+    missing has no way to say so; that needs an explicit deletion path this toolkit does not have.
+
+    **Crash window.** The primary and each ancillary are separate block writes, so an interruption
+    between them can leave new values beside old grades for one block. Re-running heals it — but
+    only if a subsequent window actually covers the crashed block; the horizon guard forbids
+    reaching arbitrarily far back, so a crash outside every later window needs a supervised
+    re-merge over that range.
     """
     _require_fixed_cfdb()
     dsattrs = ds.attrs.data
@@ -471,16 +616,25 @@ def merge_dataset(ds, stations: dict, series: dict, *, variable: str):
             'written_block': 0,
             'gap_steps': 0,
             'qc_rejected': 0,
+            'anc_qc_rejected': 0,
             'dropped_before_axis': 0,
         }
     _check_refs(non_empty, stations)
     _check_aligned(non_empty, step_us, code)
 
     dv = ds[variable]
+    # the ancillary roster comes from the STORED dataset, never from a caller argument
+    anc_names = [n for n in str(dv.attrs.data.get('ancillary_variables', '')).split() if n in ds]
+    anc_vars = {n: ds[n] for n in anc_names}
+    _check_extras(non_empty, anc_names)
+
     lo, hi = _qc_bounds(dv)
-    non_empty, n_qc = _qc_filter(non_empty, lo, hi)
+    anc_bounds = {n: _qc_bounds(av) for n, av in anc_vars.items()}
+    non_empty, n_qc, n_anc_qc = _qc_filter(non_empty, lo, hi, anc_bounds)
     if n_qc:
         logger.warning('merge %s: %d value(s) outside [%s, %s] set to NaN (min/max QC)', variable, n_qc, lo, hi)
+    if n_anc_qc:
+        logger.warning('merge %s: %d ancillary value(s) outside declared bounds set to NaN (QC)', variable, n_anc_qc)
 
     cur_ids = list(ds[STATION_ID_VAR].data)
     tdata = np.asarray(ds['time'].data)
@@ -529,8 +683,8 @@ def merge_dataset(ds, stations: dict, series: dict, *, variable: str):
         )
 
     # --- new steps (extend the dense axis, in the coord's own stored dtype) ---
-    inc_min = _floor_step(min(int(t.astype('int64').min()) for t, _ in non_empty.values()), step_us)
-    inc_max = _floor_step(max(int(t.astype('int64').max()) for t, _ in non_empty.values()), step_us)
+    inc_min = _floor_step(min(int(t.astype('int64').min()) for t, *_ in non_empty.values()), step_us)
+    inc_max = _floor_step(max(int(t.astype('int64').max()) for t, *_ in non_empty.values()), step_us)
     cur_max = int(cur_times[-1])
     # steps between the stored axis end and the incoming window start = a hole this window
     # cannot fill (pipeline downtime). The extension below NaN-fills it; report it so the
@@ -551,8 +705,10 @@ def merge_dataset(ds, stations: dict, series: dict, *, variable: str):
     width = w_hi - w_lo + 1
     existing = np.asarray(dv[:, w_lo : w_hi + 1].data, dtype='float64')  # (n_point_total, width)
     incoming = np.full_like(existing, np.nan)
+    existing_a = {n: np.asarray(anc_vars[n][:, w_lo : w_hi + 1].data, dtype='float64') for n in anc_names}
+    incoming_a = {n: np.full_like(existing, np.nan) for n in anc_names}
     n_before = 0
-    for ref, (t, v) in non_empty.items():
+    for ref, (t, v, ex) in non_empty.items():
         d = stations[ref]
         sid = envlib.compute_station_id(shapely.Point(float(d['lon']), float(d['lat'])))
         row = id_to_row[sid]
@@ -560,16 +716,31 @@ def merge_dataset(ds, stations: dict, series: dict, *, variable: str):
         ok = (col >= 0) & (col < width)
         n_before += int((col < 0).sum())  # window straddles the axis start: pre-axis values
         incoming[row, col[ok]] = v[ok]
+        for n in anc_names:
+            a = ex.get(n)
+            if a is not None:
+                incoming_a[n][row, col[ok]] = a[ok]
     if n_before:
         logger.warning('merge %s: %d incoming value(s) predate the axis start and were dropped', variable, n_before)
-    merged = np.where(np.isnan(incoming), existing, incoming)
+
+    # UNION mask: a slot is "supplied by this run" if the primary OR any ancillary has data
+    # there. One mask drives every plane, so a stored (value, code) pair can never be assembled
+    # from two different runs — and a code that exists to explain an absent value survives.
+    mask = ~np.isnan(incoming)
+    for n in anc_names:
+        mask |= ~np.isnan(incoming_a[n])
+    merged = np.where(mask, incoming, existing)
     dv[:, w_lo : w_hi + 1] = _nan_safe(merged, dv.dtype)
+    for n in anc_names:
+        merged_a = np.where(mask, incoming_a[n], existing_a[n])
+        anc_vars[n][:, w_lo : w_hi + 1] = _nan_safe(merged_a, anc_vars[n].dtype)
     return {
         'new_stations': n_new,
         'new_steps': int(n_new_steps),
         'written_block': int(width),
         'gap_steps': int(gap_steps),
         'qc_rejected': int(n_qc),
+        'anc_qc_rejected': int(n_anc_qc),
         'dropped_before_axis': int(n_before),
     }
 
@@ -583,6 +754,11 @@ def build_and_publish(cat, path, member_conn, rcg_conn, meta, stations, series, 
     optimization for LARGE, rarely-updated archives (thousands of keys — see ebooklet's
     guidance of 10-100MB per group); pass a prime ``num_groups`` only for that shape.
     The choice is fixed at first publish.
+
+    ``**build_kwargs`` go straight to ``build_local`` — including ``ancillary=`` to declare
+    companion ``(point, time)`` planes (e.g. a per-timestep quality grade), whose data rides in
+    each ``series`` entry's third tuple slot. ``update_and_publish`` needs no equivalent argument:
+    the roster is read back from the stored dataset's ``ancillary_variables`` attr.
     """
     build_local(path, meta, stations, series, **build_kwargs)
     return cat.publish(str(path), member_conn, rcg_conn, num_groups=num_groups)

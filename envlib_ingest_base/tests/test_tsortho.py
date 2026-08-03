@@ -658,6 +658,7 @@ def test_merge_heals_on_empty_window(tmp_path):
         'written_block': 0,
         'gap_steps': 0,
         'qc_rejected': 0,
+        'anc_qc_rejected': 0,
         'dropped_before_axis': 0,
     }
     with open_dataset(str(p)) as ds:
@@ -746,3 +747,237 @@ def test_altitude_out_of_range_becomes_nan(tmp_path, caplog):
         names_ = list(ds['station_name'].data)
         alt = np.asarray(ds[STATION_ALTITUDE_VAR][:].data, dtype='float64')
         assert np.isnan(alt[names_.index('Charlie')])  # out-of-band new station -> missing
+
+
+# --- ancillary variables (per-timestep companion planes, e.g. a NEMS quality grade) ---
+
+QC_SPEC = {
+    'quality_code': {
+        'units': '1',
+        'precision': 0,
+        'min_value': 0,
+        'max_value': 1000,
+        'attrs': {'standard_name': 'quality_flag', 'long_name': 'NEMS quality code'},
+    }
+}
+
+
+def _series_qc(ref_vals, ref_codes, start=BASE, n=4, step=HOUR):
+    """3-tuple series: values with an extras dict positionally paired to them."""
+    times = start + step * np.arange(n)
+    return {
+        ref: (
+            times,
+            np.asarray(vals, dtype='float64'),
+            {'quality_code': np.asarray(ref_codes[ref], dtype='float64')},
+        )
+        for ref, vals in ref_vals.items()
+    }
+
+
+def _read(p, var):
+    with open_dataset(str(p)) as ds:
+        return np.asarray(ds[var][:].data, dtype='float64')
+
+
+def test_ancillary_build_roundtrip(tmp_path):
+    stns = stations_dict(STNS_AB)
+    s = _series_qc(
+        {'A': [1.0, 2.0, 3.0, 4.0], 'B': [10.0, 11.0, 12.0, 13.0]},
+        {'A': [600, 600, 400, 500], 'B': [600, 520, 520, 600]},
+    )
+    p = tmp_path / 'sf.cfdb'
+    build_local(p, make_meta(), stns, s, **ENC, ancillary=QC_SPEC)
+
+    with open_dataset(str(p)) as ds:
+        # CF: the primary names its companion; the companion carries its own QC bounds
+        assert ds['streamflow'].attrs['ancillary_variables'] == 'quality_code'
+        qa = ds['quality_code'].attrs
+        assert qa['standard_name'] == 'quality_flag'
+        assert float(qa['valid_min']) == 0.0 and float(qa['valid_max']) == 1000.0
+        assert ds['quality_code'].shape == ds['streamflow'].shape
+        assert ds['quality_code'].chunk_shape == ds['streamflow'].chunk_shape
+        codes = np.asarray(ds['quality_code'][:].data, dtype='float64')
+    np.testing.assert_array_equal(codes[0], [600, 600, 400, 500])
+    np.testing.assert_array_equal(codes[1], [600, 520, 520, 600])
+
+    Catalogue(remotes=[], cache=str(tmp_path / 'cache')).validate(str(p))
+
+
+def test_ancillary_code_without_value_survives_merge(tmp_path):
+    # THE union-mask case: a grade whose whole job is to explain an ABSENT value (NEMS 100,
+    # "missing record") must land, even though the value plane is NaN at that slot.
+    stns = stations_dict({'A': (172.5, -43.5, 'Alpha')})
+    p = tmp_path / 'sf.cfdb'
+    build_local(p, make_meta(), stns, _series_qc({'A': [1.0, 2.0, 3.0, 4.0]}, {'A': [600, 600, 600, 600]}),
+                **ENC, ancillary=QC_SPEC)
+
+    win = {'A': (BASE + 2 * HOUR + HOUR * np.arange(2),
+                 np.asarray([np.nan, np.nan]),
+                 {'quality_code': np.asarray([100.0, 100.0])})}
+    with open_dataset(str(p), flag='w') as ds:
+        merge_dataset(ds, stns, win, variable='streamflow')
+
+    vals, codes = _read(p, 'streamflow')[0], _read(p, 'quality_code')[0]
+    assert np.isnan(vals[2]) and np.isnan(vals[3])  # value retracted to missing by the union mask
+    np.testing.assert_array_equal(codes[2:], [100, 100])  # ...and the reason survived
+    np.testing.assert_allclose(vals[:2], [1.0, 2.0], rtol=1e-3)  # untouched slots keep their pair
+    np.testing.assert_array_equal(codes[:2], [600, 600])
+
+
+def test_ancillary_value_without_code_does_not_leave_stale_code(tmp_path):
+    # a run that supplies a value but no grade must not leave the PREVIOUS run's grade beside it
+    stns = stations_dict({'A': (172.5, -43.5, 'Alpha')})
+    p = tmp_path / 'sf.cfdb'
+    build_local(p, make_meta(), stns, _series_qc({'A': [1.0, 2.0, 3.0, 4.0]}, {'A': [600, 600, 600, 600]}),
+                **ENC, ancillary=QC_SPEC)
+
+    win = {'A': (BASE + 2 * HOUR + HOUR * np.arange(2), np.asarray([30.0, 40.0]), {})}
+    with open_dataset(str(p), flag='w') as ds:
+        merge_dataset(ds, stns, win, variable='streamflow')
+
+    vals, codes = _read(p, 'streamflow')[0], _read(p, 'quality_code')[0]
+    np.testing.assert_allclose(vals[2:], [30.0, 40.0], rtol=1e-3)
+    assert np.isnan(codes[2]) and np.isnan(codes[3])  # stale 600 must NOT survive under a new value
+    np.testing.assert_array_equal(codes[:2], [600, 600])
+
+
+def test_ancillary_all_nan_incoming_leaves_stored_pair(tmp_path):
+    # the offline-station protection still holds with two planes: an all-NaN incoming slot
+    # changes nothing (this is also why the merge cannot express a deletion)
+    stns = stations_dict({'A': (172.5, -43.5, 'Alpha')})
+    p = tmp_path / 'sf.cfdb'
+    build_local(p, make_meta(), stns, _series_qc({'A': [1.0, 2.0, 3.0, 4.0]}, {'A': [600, 600, 600, 600]}),
+                **ENC, ancillary=QC_SPEC)
+
+    win = {'A': (BASE + 2 * HOUR + HOUR * np.arange(2),
+                 np.asarray([np.nan, np.nan]),
+                 {'quality_code': np.asarray([np.nan, np.nan])})}
+    with open_dataset(str(p), flag='w') as ds:
+        merge_dataset(ds, stns, win, variable='streamflow')
+
+    np.testing.assert_allclose(_read(p, 'streamflow')[0], [1, 2, 3, 4], rtol=1e-3)
+    np.testing.assert_array_equal(_read(p, 'quality_code')[0], [600, 600, 600, 600])
+
+
+def test_ancillary_merge_idempotent(tmp_path):
+    stns = stations_dict({'A': (172.5, -43.5, 'Alpha')})
+    p = tmp_path / 'sf.cfdb'
+    build_local(p, make_meta(), stns, _series_qc({'A': [1.0, 2.0, 3.0, 4.0]}, {'A': [600, 600, 600, 600]}),
+                **ENC, ancillary=QC_SPEC)
+    win = _series_qc({'A': [30.0, 40.0, 50.0, 60.0]}, {'A': [400, 400, 520, 520]}, start=BASE + 2 * HOUR, n=4)
+
+    def run():
+        with open_dataset(str(p), flag='w') as ds:
+            return merge_dataset(ds, stns, win, variable='streamflow')
+
+    r1 = run()
+    v1, c1 = _read(p, 'streamflow'), _read(p, 'quality_code')
+    r2 = run()
+    v2, c2 = _read(p, 'streamflow'), _read(p, 'quality_code')
+
+    assert r1['new_steps'] == 2 and r2['new_steps'] == 0
+    np.testing.assert_array_equal(np.nan_to_num(v1, nan=-1), np.nan_to_num(v2, nan=-1))
+    np.testing.assert_array_equal(np.nan_to_num(c1, nan=-1), np.nan_to_num(c2, nan=-1))
+    np.testing.assert_array_equal(c2[0], [600, 600, 400, 400, 520, 520])
+
+
+def test_ancillary_qc_value_reject_drops_its_code(tmp_path):
+    # a value refused by the primary QC bounds takes its grade with it: a plausibility grade
+    # for a measurement we declined to store describes nothing
+    stns = stations_dict({'A': (172.5, -43.5, 'Alpha')})
+    p = tmp_path / 'sf.cfdb'
+    s = _series_qc({'A': [1.0, 1e9, 3.0, 4.0]}, {'A': [600, 600, 600, 600]})  # 1e9 > max_value
+    build_local(p, make_meta(), stns, s, **ENC, ancillary=QC_SPEC)
+
+    vals, codes = _read(p, 'streamflow')[0], _read(p, 'quality_code')[0]
+    assert np.isnan(vals[1]) and np.isnan(codes[1])
+    np.testing.assert_array_equal(codes[[0, 2, 3]], [600, 600, 600])
+
+
+def test_ancillary_qc_code_reject_keeps_value(tmp_path):
+    # an out-of-band CODE is dropped on its own; the measurement it annotates is still good.
+    # NB the encoder passes above-max through, so valid_min/valid_max are what enforce this.
+    stns = stations_dict({'A': (172.5, -43.5, 'Alpha')})
+    p = tmp_path / 'sf.cfdb'
+    s = _series_qc({'A': [1.0, 2.0, 3.0, 4.0]}, {'A': [600, 32767, 600, 600]})  # int16 fill leaked in
+    build_local(p, make_meta(), stns, s, **ENC, ancillary=QC_SPEC)
+
+    vals, codes = _read(p, 'streamflow')[0], _read(p, 'quality_code')[0]
+    np.testing.assert_allclose(vals, [1, 2, 3, 4], rtol=1e-3)  # value untouched
+    assert np.isnan(codes[1])
+
+
+def test_ancillary_ragged_extras_raise_pre_mutation(tmp_path):
+    stns = stations_dict({'A': (172.5, -43.5, 'Alpha')})
+    bad = {'A': (BASE + HOUR * np.arange(4), np.asarray([1.0, 2, 3, 4]),
+                 {'quality_code': np.asarray([600.0, 600.0])})}  # 2 codes for 4 values
+    with pytest.raises(ValueError, match='positionally paired'):
+        build_local(tmp_path / 'sf.cfdb', make_meta(), stns, bad, **ENC, ancillary=QC_SPEC)
+    assert not (tmp_path / 'sf.cfdb').exists()
+
+
+def test_ancillary_undeclared_name_raises(tmp_path):
+    stns = stations_dict({'A': (172.5, -43.5, 'Alpha')})
+    s = {'A': (BASE + HOUR * np.arange(4), np.asarray([1.0, 2, 3, 4]),
+               {'not_declared': np.asarray([1.0, 2, 3, 4])})}
+    with pytest.raises(ValueError, match='not declared'):
+        build_local(tmp_path / 'sf.cfdb', make_meta(), stns, s, **ENC, ancillary=QC_SPEC)
+
+
+def test_extras_into_legacy_dataset_raise(tmp_path):
+    # a dataset built WITHOUT an ancillary roster must refuse incoming codes rather than
+    # silently discard them (no rebuild puts per-timestep data back)
+    stns = stations_dict({'A': (172.5, -43.5, 'Alpha')})
+    p = tmp_path / 'sf.cfdb'
+    build_local(p, make_meta(), stns, _series({'A': [1.0, 2.0, 3.0, 4.0]}), **ENC)  # no ancillary
+    win = _series_qc({'A': [30.0, 40.0]}, {'A': [400, 400]}, start=BASE + 2 * HOUR, n=2)
+    with open_dataset(str(p), flag='w') as ds, pytest.raises(ValueError, match='not declared'):
+        merge_dataset(ds, stns, win, variable='streamflow')
+
+
+def test_no_ancillary_collapses_to_old_behaviour(tmp_path):
+    # backward compatibility: with no ancillary plane the union mask must reduce EXACTLY to the
+    # old "non-NaN incoming wins" rule, and no roster attr may appear.
+    # (Not asserted byte-wise: two independent builds differ by cfdb's per-file uuid — the
+    # existing sha test compares one file before/after, which is a different claim.)
+    stns = stations_dict(STNS_AB)
+    h = _series({'A': [1.0, 2.0, 3.0, 4.0], 'B': [10.0, 11.0, 12.0, 13.0]})
+    p = tmp_path / 'sf.cfdb'
+    build_local(p, make_meta(), stns, h, **ENC)
+    with open_dataset(str(p)) as ds:
+        assert 'ancillary_variables' not in ds['streamflow'].attrs.data
+
+    # B's first slot is NaN incoming -> must NOT clobber the stored 12.0
+    win = _series({'A': [30.0, 40.0], 'B': [np.nan, 15.0]}, start=BASE + 2 * HOUR, n=2)
+    with open_dataset(str(p), flag='w') as ds:
+        r = merge_dataset(ds, stns, win, variable='streamflow')
+
+    a = _read(p, 'streamflow')
+    np.testing.assert_allclose(a[0], [1, 2, 30, 40], rtol=1e-3)
+    np.testing.assert_allclose(a[1], [10, 11, 12, 15], rtol=1e-3)  # 12.0 survived the NaN
+    assert r['anc_qc_rejected'] == 0  # key present and inert on the no-ancillary path
+
+
+def test_ancillary_repeat_merge_is_value_stable_not_byte_stable(tmp_path):
+    # Pins the real contract, and guards against over-claiming it. A repeated non-empty merge is
+    # idempotent in VALUES on both planes, but NOT byte-stable: booklet appends, so the file grows
+    # a little each run (dead space, prunable). This is pre-existing and independent of ancillary
+    # support — test_heal_rerun_is_upload_clean's byte claim holds only for an EMPTY window, which
+    # returns before any write.
+    stns = stations_dict({'A': (172.5, -43.5, 'Alpha')})
+    p = tmp_path / 'sf.cfdb'
+    build_local(p, make_meta(), stns, _series_qc({'A': [1.0, 2.0, 3.0, 4.0]}, {'A': [600, 600, 600, 600]}),
+                **ENC, ancillary=QC_SPEC)
+    win = _series_qc({'A': [30.0, 40.0]}, {'A': [400, 400]}, start=BASE + 2 * HOUR, n=2)
+
+    def _run():
+        with open_dataset(str(p), flag='w') as ds:
+            merge_dataset(ds, stns, win, variable='streamflow')
+        return _read(p, 'streamflow'), _read(p, 'quality_code'), hashlib.sha256(p.read_bytes()).hexdigest()
+
+    v1, c1, h1 = _run()
+    v2, c2, h2 = _run()
+    np.testing.assert_array_equal(np.nan_to_num(v1, nan=-1), np.nan_to_num(v2, nan=-1))
+    np.testing.assert_array_equal(np.nan_to_num(c1, nan=-1), np.nan_to_num(c2, nan=-1))
+    assert h1 != h2  # documents the append-growth; flip this if cfdb ever becomes write-eliding

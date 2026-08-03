@@ -236,7 +236,7 @@ meta = envlib.Metadata(
 )
 ```
 
-### `build_local(path, meta, stations, series, *, variable, units, precision, min_value, max_value, chunk_shape=None, standard_name=None, extra_var_attrs=None)`
+### `build_local(path, meta, stations, series, *, variable, units, precision, min_value, max_value, chunk_shape=None, standard_name=None, extra_var_attrs=None, ancillary=None)`
 
 Create a fresh local ts_ortho cfdb at the cadence of `meta.frequency_interval`. **Requires
 cfdb >= 0.9.4** (older versions fabricate values when the packed encoder meets NaN or
@@ -262,6 +262,37 @@ from envlib import Catalogue
 Catalogue(remotes=[]).validate('flow.cfdb')   # {'metadata', 'dataset_version_id', 'state', ...}
 ```
 
+#### Ancillary variables — per-timestep metadata *about* each value
+
+`ancillary` declares companion `(point, time)` planes carrying information about each value rather
+than more values — a per-observation quality grade on a quality-controlled product being the
+motivating case. Their data rides along in each series entry as a third tuple slot:
+
+```python
+QC = {'quality_code': {'units': '1', 'precision': 0, 'min_value': 0, 'max_value': 1000,
+                       'attrs': {'standard_name': 'quality_flag',
+                                 'long_name': 'NEMS quality code'}}}
+
+series = {'68801': (times, values, {'quality_code': codes})}   # extras paired 1:1 with values
+
+build_local('flow.cfdb', meta, stations, series, variable='streamflow', units='m^3/s',
+            precision=4, min_value=0, max_value=20_000, ancillary=QC)
+```
+
+The pairing is **positional and structural** — same length, same timestamps — so a value and its
+grade cannot desynchronize; a ragged extras array raises before anything is written. The primary
+variable gets a CF `ancillary_variables` attr naming the companions, and that attr is the roster
+`merge_dataset` reads back: the stored dataset, never a caller argument, is the source of truth on
+update. Incoming extras naming an undeclared variable **raise** — silently dropping per-timestep
+quality data is unrecoverable without re-running the whole extraction.
+
+Ancillaries are stored as **packed floats, not integers**: the entire merge/QC machinery is
+NaN-based, and an integer plane cannot express "no incoming code" at all. `precision=0` with bounds
+`0–1000` gives uint16 storage and a reserved fill that decodes to NaN. Their `valid_min`/`valid_max`
+attrs are load-bearing rather than decorative — the encoder rejects below-min and non-finite values
+but **passes above-max straight through**, so without them a merge falls back to the far wider
+encodable range and a junk high code would persist silently.
+
 ### `merge_dataset(ds, stations, series, *, variable)`
 
 Fold a recent window into an **open** ts_ortho dataset (cfdb `Dataset` or `EDataset`, opened `flag='w'`).
@@ -279,11 +310,29 @@ from envlib_ingest_base import merge_dataset
 with open_dataset('flow.cfdb', flag='w') as ds:
     merge_dataset(ds, stations, series_recent, variable='streamflow')
     # -> {'new_stations': 0, 'new_steps': 24, 'written_block': 72, 'gap_steps': 0,
-    #     'qc_rejected': 0, 'dropped_before_axis': 0}
+    #     'qc_rejected': 0, 'anc_qc_rejected': 0, 'dropped_before_axis': 0}
     # gap_steps: steps left unfilled behind this window (pipeline downtime) — holes are NaN,
     #            so refetching a wider window and re-merging heals them
     # qc_rejected: values outside the encodable range set to NaN by the min/max QC
+    # anc_qc_rejected: ancillary values outside their own declared bounds, set to NaN
 ```
+
+When the dataset carries ancillary variables, the write is governed by a single **union mask**: a
+slot counts as "supplied by this run" when the primary *or* any ancillary is non-NaN there, and
+every plane is then taken from that run. So a stored (value, grade) pair always originates from one
+run — a later run can never leave its value beside an earlier run's grade — and a grade whose whole
+job is to explain an absence (NEMS 100, "missing record") is representable rather than dropped. A
+value rejected by the primary QC bounds takes its grade with it.
+
+Note the deliberate asymmetry: an all-NaN incoming slot leaves the stored pair untouched. That is
+what protects an offline station's history, and it is also why this merge **cannot express a
+retraction** — a source that revises a reading *to* missing has no way to say so. That needs an
+explicit deletion path the toolkit does not currently have.
+
+The primary and each ancillary are separate block writes, so an interruption between them can leave
+new values beside old grades for one block. Re-running heals it, but only if a later window actually
+covers the crashed block — the horizon guard forbids reaching arbitrarily far back, so a crash
+outside every later window needs a supervised re-merge over that range.
 
 ### `build_and_publish(...)` / `update_and_publish(...)` — publish to the commons
 
