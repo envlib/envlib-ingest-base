@@ -7,7 +7,9 @@ cross-checks, and legacy-[us]-axis compatibility.
 
 import hashlib
 import logging
+import tracemalloc
 
+import booklet
 import cfdb as cfdb_module
 import envlib
 import numpy as np
@@ -981,3 +983,116 @@ def test_ancillary_repeat_merge_is_value_stable_not_byte_stable(tmp_path):
     np.testing.assert_array_equal(np.nan_to_num(v1, nan=-1), np.nan_to_num(v2, nan=-1))
     np.testing.assert_array_equal(np.nan_to_num(c1, nan=-1), np.nan_to_num(c2, nan=-1))
     assert h1 != h2  # documents the append-growth; flip this if cfdb ever becomes write-eliding
+
+
+# --- chunked writes: build_local must never materialise a whole plane --------------------------
+# These lock in the 2026-08-06 refactor (dual-blind reviewed, round `chunked-1`). Before it,
+# build_local allocated np.full((n_stations, n_times)) per plane and assigned it in one statement,
+# which is what a chunked array database exists to avoid: memory scaled with the DIMENSIONS rather
+# than with how much data there actually was. Measured on the real ECan streamflow build: 4.5 GB
+# peak for a 51 MB, 20%-dense file.
+
+
+def test_build_local_peak_allocation_is_bounded_by_one_row(tmp_path):
+    """The PROPERTY, not the implementation: peak allocation must track a ROW, not a PLANE.
+
+    Fails hard on the pre-refactor code — the dense plane alone is 240 MB here against ~4 MB of
+    real data. `tracemalloc` is used rather than RSS because it captures numpy allocations
+    deterministically and does not vary with the machine or the allocator's high-water mark.
+    """
+    n_stations, n_steps = 200, 150_000
+    plane_bytes = n_stations * n_steps * 8          # 240 MB
+    row_bytes = n_steps * 8                         # 1.2 MB
+
+    rng = np.random.default_rng(0)
+    stns = stations_dict({f'S{i:03d}': (171.0 + i * 0.01, -43.0 - i * 0.01, f's{i}') for i in range(n_stations)})
+    series = {}
+    for i, ref in enumerate(stns):
+        if i % 5 == 0:
+            continue                                # no data: still gets an all-NaN row
+        idx = np.sort(rng.choice(n_steps, size=400, replace=False))
+        series[ref] = (BASE + HOUR * idx, np.abs(rng.normal(10, 3, idx.size)))
+
+    p = tmp_path / 'bounded.cfdb'
+    tracemalloc.start()
+    build_local(p, make_meta(), stns, series, **ENC)
+    _cur, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    # generous: 20 rows of headroom for cfdb's per-call chunk buffer and encode copies, but still
+    # an order of magnitude below a single plane. Pre-refactor this measured >6x the plane.
+    assert peak < 20 * row_bytes, (
+        f'peak {peak / 1e6:.1f} MB exceeds 20 rows ({20 * row_bytes / 1e6:.1f} MB); '
+        f'a whole plane would be {plane_bytes / 1e6:.1f} MB — the build is materialising again'
+    )
+
+
+def test_rows_align_to_stations_not_to_series(tmp_path):
+    """Stations WITHOUT data must not shift the rows of the stations after them.
+
+    The point coord and the station_id/ref/name vars are built in `stations` order, so row i must
+    be the i-th entry of `stations`. Driving the row loop from `series` instead maps the i-th
+    station-that-has-data to point i and silently mislabels every station after the first
+    data-less one — producing a file that validates cleanly and is wrong.
+
+    A fixture where stations == series cannot catch this, which is exactly why this one has gaps
+    at the START, MIDDLE and END of the station order.
+    """
+    order = ['A', 'B', 'C', 'D', 'E']
+    stns = stations_dict({r: (171.0 + i, -43.0 - i, f'name-{r}') for i, r in enumerate(order)})
+    # A (first), C (middle) and E (last) have no data
+    series = _series({'B': [1.0, 2.0, 3.0, 4.0], 'D': [10.0, 20.0, 30.0, 40.0]})
+
+    p = tmp_path / 'align.cfdb'
+    build_local(p, make_meta(), stns, series, **ENC)
+
+    with open_dataset(str(p)) as ds:
+        refs = [str(x) for x in np.asarray(ds['station_ref'].data)]
+        names = [str(x) for x in np.asarray(ds['station_name'].data)]
+        vals = np.asarray(ds['streamflow'][:])
+
+    assert refs == order, f'station_ref order changed: {refs}'
+    assert names == [f'name-{r}' for r in order]
+    # the data must sit on B (row 1) and D (row 3) — NOT rows 0 and 1
+    assert np.isnan(vals[0]).all(), 'row 0 (A, no data) should be all-NaN'
+    assert np.isnan(vals[2]).all(), 'row 2 (C, no data) should be all-NaN'
+    assert np.isnan(vals[4]).all(), 'row 4 (E, no data) should be all-NaN'
+    np.testing.assert_allclose(vals[1, :4], [1.0, 2.0, 3.0, 4.0])
+    np.testing.assert_allclose(vals[3, :4], [10.0, 20.0, 30.0, 40.0])
+
+
+def test_each_chunk_written_exactly_once(tmp_path):
+    """Revisiting a chunk is invisible in the output but costs real money.
+
+    A rewritten chunk means a full decompress+recompress, orphans the previous block (the store is
+    log-structured, so the file GROWS until pruned), and can force a synchronous buffer flush. The
+    resulting file is still correct — so only a write counter catches a regression here.
+    """
+    n_steps = 60_000                                  # spans 3 chunks at the 25k default
+    stns = stations_dict(STNS_AB)
+    rng = np.random.default_rng(1)
+    series = {r: (BASE + HOUR * np.sort(rng.choice(n_steps, 300, replace=False)),
+                  np.abs(rng.normal(5, 1, 300)))
+              for r in stns}
+
+    p = tmp_path / 'once.cfdb'
+    writes = {'n': 0}
+    # cfdb writes chunks through booklet's VariableLengthValue.set (there is no `Booklet` class)
+    real_set = booklet.VariableLengthValue.set
+
+    def counting_set(self, key, value, *a, **kw):
+        writes['n'] += 1
+        return real_set(self, key, value, *a, **kw)
+
+    booklet.VariableLengthValue.set = counting_set
+    try:
+        build_local(p, make_meta(), stns, series, **ENC)
+    finally:
+        booklet.VariableLengthValue.set = real_set
+
+    with booklet.open(str(p)) as f:
+        n_keys = len(list(f.keys()))
+    # every stored key written once; a small allowance for metadata keys rewritten at close
+    assert writes['n'] <= n_keys + 5, (
+        f'{writes["n"]} writes for {n_keys} stored keys — chunks are being revisited'
+    )

@@ -247,6 +247,15 @@ attrs so merges apply the same filter). `precision` is
 **decimal places** (cfdb picks the int packing width from `precision` + `min_value`/`max_value`);
 pass `standard_name` to override envlib's auto-derived CF name. Returns the path.
 
+**Memory: bounded by ONE STATION ROW, not by the dataset.** Rows are written individually
+(`var[i, :] = row`), matching the ts_ortho `chunk_shape` of `(1, time_chunk)`, so a build's peak
+tracks `n_times` rather than `n_stations × n_times`. Measured on 400 stations × 150,000 steps:
+~11 MB peak, against ~480 MB for a single dense plane — and it is *faster* than the whole-plane
+write, since the large transient allocations are gone. **What this does NOT cover:** `series` is
+still a dict holding every station's arrays, so the *caller* carries ~24 B per stored observation
+for the whole build (~784 MB on a 33 M-observation source). On a large source that dict — not the
+write — is the ceiling.
+
 ```python
 from envlib_ingest_base import build_local
 

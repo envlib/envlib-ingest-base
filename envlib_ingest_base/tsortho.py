@@ -343,26 +343,45 @@ def _check_extras(non_empty: dict, roster) -> None:
             raise ValueError(msg)
 
 
-def _assemble(stations: dict, series: dict, t0_us: int, n_times: int, step_us: int, plane=None) -> np.ndarray:
-    """Dense (n_point, n_time) float array; NaN where a station has no value at a step.
+def _write_rows(var, stations: dict, series: dict, t0_us: int, n_times: int, step_us: int, dt, plane=None) -> None:
+    """Write the dense ``(n_point, n_time)`` plane ONE STATION ROW AT A TIME.
 
-    ``plane=None`` assembles the primary values; a string assembles that named ancillary
-    (stations lacking it stay NaN), so both planes share this one code path and land on
-    identical geometry.
+    This replaces an earlier ``_assemble`` that built the whole dense plane in memory and
+    returned it for a single ``var[:] = ...`` assignment. **That defeated the main reason to use
+    cfdb.** cfdb reads and writes in chunks, and the ts_ortho chunk shape is ``(1, time_chunk)``
+    — *one station row* — so the whole-plane approach allocated a station-count multiple of what
+    a write actually needs. Measured on a 606-station by 620,771-step dataset: 3.01 GB per plane,
+    two planes, and roughly double again for ``_nan_safe``'s mask and copy. Per row it is ~5 MB.
+
+    ``plane=None`` writes the primary values; a string writes that named ancillary (stations
+    lacking it stay NaN), so both share one code path and land on identical geometry.
+
+    ⚠️ **Iterate ``stations``, never ``series``.** The point coordinate and the
+    ``station_id``/``station_ref``/``station_name`` arrays are built in ``stations`` order, so row
+    ``i`` MUST be the ``i``-th entry of ``stations``. Driving the loop from ``series`` instead
+    would map the *i*-th station-that-has-data to point *i* and silently mislabel every station
+    after the first data-less one — a file that validates cleanly and is wrong.
+
+    A station with no data still gets an explicitly written all-NaN row, exactly as before: an
+    unwritten chunk also reads as NaN, but it would change which chunks exist and the file size.
+
+    Each row is written in ONE call, and each chunk therefore exactly once. Revisiting a chunk
+    costs a full decompress+recompress, orphans the previous block (the store is log-structured,
+    so the file grows until pruned), and can force a synchronous buffer flush.
     """
-    data = np.full((len(stations), n_times), np.nan, dtype='float64')
     for i, ref in enumerate(stations):
+        # a fresh row per station: nothing is ever aliased into cfdb's chunk buffer, and the
+        # peak is one row regardless of station count
+        row = np.full(n_times, np.nan, dtype='float64')
         s = series.get(ref)
-        if s is None:
-            continue
-        t, v, ex = s
-        arr = v if plane is None else ex.get(plane)
-        if arr is None:
-            continue
-        col = _step_index(t, t0_us, step_us)
-        ok = (col >= 0) & (col < n_times)
-        data[i, col[ok]] = arr[ok]
-    return data
+        if s is not None:
+            t, v, ex = s
+            arr = v if plane is None else ex.get(plane)
+            if arr is not None:
+                col = _step_index(t, t0_us, step_us)
+                ok = (col >= 0) & (col < n_times)
+                row[col[ok]] = arr[ok]
+        var[i, :] = _nan_safe(row, dt)
 
 
 def _points_ids_names(stations: dict):
@@ -487,7 +506,8 @@ def build_local(
     tmin = _floor_step(min(int(t.astype('int64').min()) for t, *_ in non_empty.values()), step_us)
     tmax = _floor_step(max(int(t.astype('int64').max()) for t, *_ in non_empty.values()), step_us)
     times_us = np.arange(tmin, tmax + 1, step_us)
-    data = _assemble(stations, non_empty, tmin, times_us.size, step_us)
+    # NOTE: the dense plane is NOT assembled here. Rows are written individually inside the
+    # dataset context below (see _write_rows) so peak memory is one row, not one plane.
     points, ids, names, refs = _points_ids_names(stations)
 
     if chunk_shape is None:
@@ -521,7 +541,7 @@ def build_local(
         # merge_dataset reads back, so the stored dataset stays the source of truth on update.
         if ancillary:
             dv.attrs['ancillary_variables'] = ' '.join(ancillary)
-        dv[:] = _nan_safe(data, dt)
+        _write_rows(dv, stations, non_empty, tmin, times_us.size, step_us, dt)
 
         for aname, spec in ancillary.items():
             adt = dtypes.dtype(
@@ -537,9 +557,10 @@ def build_local(
             # written LAST so a caller-supplied attrs dict can never weaken the QC bounds
             av.attrs['valid_min'] = float(spec['min_value'])
             av.attrs['valid_max'] = float(spec['max_value'])
-            av[:] = _nan_safe(
-                _assemble(stations, non_empty, tmin, times_us.size, step_us, plane=aname), adt
-            )
+            # Previously this nested a whole-plane _assemble INSIDE _nan_safe while the primary
+            # plane was still resident — three full planes plus a mask live at once, the worst
+            # single moment in the build. Now one row at a time, like the primary.
+            _write_rows(av, stations, non_empty, tmin, times_us.size, step_us, adt, plane=aname)
 
         sid = ds.create.data_var.generic(STATION_ID_VAR, ('point',), dtype=dtypes.dtype('str'))
         sid[:] = ids
