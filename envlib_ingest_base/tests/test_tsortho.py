@@ -1096,3 +1096,93 @@ def test_each_chunk_written_exactly_once(tmp_path):
     assert writes['n'] <= n_keys + 5, (
         f'{writes["n"]} writes for {n_keys} stored keys — chunks are being revisited'
     )
+
+
+def test_merge_peak_does_not_scale_with_a_backdated_station(tmp_path):
+    """One stale timestamp must not widen the read for EVERY station.
+
+    `merge_dataset` used to read `dv[:, w_lo:w_hi+1]` across the full point dimension, with the
+    bounds taken from the GLOBAL min/max incoming timestamp — so a single station carrying one
+    backdated value stretched the block across all of them. Measured before the per-station
+    rewrite: a routine 48-step merge went from 6 MB to 552 MB on a 150 x 60,000 dataset, and at
+    production scale that is gigabytes inside an hourly cron.
+
+    Per-station, only the offending station reads a wide row, so the peak is unchanged.
+    """
+    # enough stations that a whole-point-dim block is an order of magnitude above one row —
+    # otherwise the assertion cannot discriminate between the two implementations
+    n_stations, n_steps = 200, 20_000
+    stns = stations_dict({f'S{i:03d}': (171.0 + i * 0.01, -43.0 - i * 0.01, f's{i}') for i in range(n_stations)})
+    rng = np.random.default_rng(0)
+    initial = {r: (BASE + HOUR * np.arange(n_steps), np.abs(rng.normal(10, 2, n_steps)))
+               for r in stns}
+    p = tmp_path / 'wide.cfdb'
+    build_local(p, make_meta(), stns, initial, **ENC)
+
+    # a routine window at the END of the axis, except ONE station also reports near the START
+    tail = BASE + HOUR * np.arange(n_steps - 48, n_steps)
+    window = {}
+    for i, r in enumerate(stns):
+        t, v = tail, np.abs(rng.normal(10, 2, 48))
+        if i == 0:
+            t = np.concatenate([[BASE + HOUR * 5], t])
+            v = np.concatenate([[1.0], v])
+        window[r] = (t, v)
+
+    tracemalloc.start()
+    with open_dataset(str(p), flag='w') as ds:
+        merge_dataset(ds, stns, window, variable='streamflow')
+    _cur, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    # The old code held ~6-7 arrays of (n_point x width); the new one holds a handful of ROWS.
+    # Assert against a quarter of ONE whole-point-dim block: comfortably above the per-station
+    # cost (which includes cfdb's per-call chunk buffer) and far below even a single block.
+    whole_block = n_stations * n_steps * 8
+    assert peak < whole_block / 4, (
+        f'merge peak {peak / 1e6:.1f} MB exceeds a quarter of one whole-point-dim block '
+        f'({whole_block / 4e6:.1f} MB; the full block is {whole_block / 1e6:.1f} MB, and the old '
+        f'code held ~6-7 of them) — a single backdated station is widening the read for every '
+        f'station again'
+    )
+
+
+def test_merge_does_not_rewrite_stations_that_reported_nothing(tmp_path):
+    """A station absent from the window must not have its chunks rewritten.
+
+    The old whole-block merge wrote `existing` back over every station in the block, including
+    ones that supplied nothing — identical bytes, but a rewrite all the same. In a log-structured
+    store that orphans the previous block (the file grows), and because the remote pushes changed
+    keys it also uploads those chunks on every run.
+    """
+    stns = stations_dict({'A': (172.5, -43.5, 'Alpha'), 'B': (171.9, -43.1, 'Bravo')})
+    p = tmp_path / 'quiet.cfdb'
+    build_local(p, make_meta(), stns, _series({'A': [1.0, 2.0, 3.0, 4.0], 'B': [10.0, 11.0, 12.0, 13.0]}), **ENC)
+
+    writes = []
+    real_set = booklet.VariableLengthValue.set
+
+    def counting_set(self, key, value, *a, **kw):
+        writes.append(key)
+        return real_set(self, key, value, *a, **kw)
+
+    booklet.VariableLengthValue.set = counting_set
+    try:
+        with open_dataset(str(p), flag='w') as ds:
+            # n=2 is REQUIRED: _series defaults to n=4 and would build 4 timestamps for 2 values
+            merge_dataset(ds, stns, _series({'A': [5.0, 6.0]}, start=BASE + 2 * HOUR, n=2),
+                          variable='streamflow')
+    finally:
+        booklet.VariableLengthValue.set = real_set
+
+    # booklet keys are `str`, formatted '{var}!{start0}.{start1}' — so B (row 1) is 'streamflow!1.*'.
+    # NOTE the type: an earlier version of this test filtered on `bytes` and therefore matched
+    # NOTHING, passing identically on the old and new code. A filter that never fires is not a test.
+    assert all(isinstance(k, str) for k in writes), 'key type changed; this filter is now vacuous'
+    a_row_writes = [k for k in writes if k.startswith('streamflow!0.')]
+    b_row_writes = [k for k in writes if k.startswith('streamflow!1.')]
+    assert a_row_writes, (
+        'station A reported data but no chunk of its row was written — the filter is wrong, '
+        'not the code'
+    )
+    assert not b_row_writes, f'station B reported nothing but its chunks were rewritten: {b_row_writes}'

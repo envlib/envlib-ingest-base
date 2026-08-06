@@ -60,11 +60,17 @@ grows an ``origin`` feature; see the OPEN_WORK follow-up):
 Known one-directional limit: data resampled *coarser* than declared (daily labels are valid
 hour multiples) builds a sparse-but-aligned axis the guards cannot detect.
 
-The **merge** is the operational core: each run resamples a recent window and folds it in via a
-single contiguous read-modify-write of the affected time block, writing incoming values only
-where they are non-NaN (so a station that is briefly offline, or an interval that resamples to
-NaN, never clobbers good stored data). New stations append to the point axis; new steps extend
-the time axis (in the coord's own stored dtype). A re-run over the same window is a no-op.
+The **merge** is the operational core: each run resamples a recent window and folds it in with a
+read-modify-write **per station, each over its own window**, writing incoming values only where
+they are non-NaN (so a station that is briefly offline, or an interval that resamples to NaN,
+never clobbers good stored data). New stations append to the point axis; new steps extend the
+time axis (in the coord's own stored dtype). A re-run over the same window is a no-op.
+
+Both write paths — build and merge — iterate BY STATION, matching the ts_ortho chunk shape of
+`(1, time_chunk)`. Peak memory therefore tracks one station's row, never the point dimension.
+Note the store is log-structured, so each merge orphans the chunks it rewrites: a continuously
+merged dataset grows every run and wants a periodic `ds.prune()` (local-only, timestamp-preserving,
+so it cannot inflate a push).
 
 The cfdb-level functions (``build_local``, ``merge_dataset``) take an open dataset / path and
 are unit-tested without any remote. ``build_and_publish`` / ``update_and_publish`` wrap them
@@ -590,9 +596,10 @@ def merge_dataset(ds, stations: dict, series: dict, *, variable: str):
 
     The cadence comes from the dataset's own ``envlib_frequency_interval`` attr (written at
     build), cross-checked against the actual axis (origin on the epoch grid, dense constant
-    step). Appends new stations and new steps (in the coord's stored dtype), then does a single
-    contiguous read-modify-write over the affected time block, keeping existing values where
-    the incoming value is NaN. Idempotent for a fixed input window.
+    step). Appends new stations and new steps (in the coord's stored dtype), then read-modify-writes
+    ONE STATION AT A TIME, each over its own window, keeping existing values where the incoming
+    value is NaN. Idempotent for a fixed input window. Stations that supply nothing this run are
+    not read or written at all.
 
     Requires a writable dataset: the station-attr heal runs on every call (even an empty window,
     before the early return), so calling this on a read-only dataset raises rather than no-opping.
@@ -722,43 +729,77 @@ def merge_dataset(ds, stations: dict, series: dict, *, variable: str):
     if w_hi < 0:
         msg = f'incoming window ends before the axis start ({tdata[0]}) — refusing to prepend history'
         raise ValueError(msg)
-    w_lo = max((inc_min - t0) // step_us, 0)
-    width = w_hi - w_lo + 1
-    existing = np.asarray(dv[:, w_lo : w_hi + 1].data, dtype='float64')  # (n_point_total, width)
-    incoming = np.full_like(existing, np.nan)
-    existing_a = {n: np.asarray(anc_vars[n][:, w_lo : w_hi + 1].data, dtype='float64') for n in anc_names}
-    incoming_a = {n: np.full_like(existing, np.nan) for n in anc_names}
+    # ONE STATION AT A TIME, each over ITS OWN window — never one block spanning every point.
+    #
+    # This previously read `dv[:, w_lo:w_hi+1]` across the FULL point dimension, where w_lo/w_hi
+    # came from the GLOBAL min/max incoming timestamp. Two consequences, both bad:
+    #
+    #   * MEMORY: ~6-7 float64 blocks of (n_point x global_width) live at once. One station
+    #     reporting a backdated timestamp widened the block for EVERY station — measured, a
+    #     single stale value took a 48-step merge from 9 MB to 228 MB, and at production scale
+    #     that is gigabytes inside an hourly cron.
+    #   * WRITE AMPLIFICATION: every station's chunks in the block were rewritten even when that
+    #     station supplied nothing this run (its slots merged to `existing`, i.e. back to
+    #     themselves). Since the store is log-structured and the remote pushes changed keys,
+    #     that is an upload of the whole block's chunks on every single run.
+    #
+    # Per-station is simply correct here: the union mask is elementwise and `incoming[row]` only
+    # ever carries data for the station at `row`, so there is NO cross-station dependency to
+    # preserve. Each station's window is its own, so a backdated value widens only its own read,
+    # and stations that reported nothing are not touched at all.
+    #
+    # chunk_shape is (1, time_chunk), so a row IS the chunk row: this reads and writes exactly
+    # the chunks it must, one station's worth at a time.
     n_before = 0
+    widest = 0
     for ref, (t, v, ex) in non_empty.items():
         d = stations[ref]
         sid = envlib.compute_station_id(shapely.Point(float(d['lon']), float(d['lat'])))
         row = id_to_row[sid]
-        col = _step_index(t, t0, step_us) - w_lo
-        ok = (col >= 0) & (col < width)
-        n_before += int((col < 0).sum())  # window straddles the axis start: pre-axis values
-        incoming[row, col[ok]] = v[ok]
+        col_abs = _step_index(t, t0, step_us)
+        n_before += int((col_abs < 0).sum())  # window straddles the axis start: pre-axis values
+        keep = col_abs >= 0
+        if not keep.any():
+            continue
+        lo, hi = int(col_abs[keep].min()), int(col_abs[keep].max())
+        width = hi - lo + 1
+        widest = max(widest, width)
+        col = col_abs[keep] - lo
+
+        existing = np.asarray(dv[row, lo : hi + 1].data, dtype='float64').ravel()
+        incoming = np.full(width, np.nan)
+        incoming[col] = v[keep]
+        existing_a, incoming_a = {}, {}
         for n in anc_names:
+            existing_a[n] = np.asarray(anc_vars[n][row, lo : hi + 1].data, dtype='float64').ravel()
+            inc = np.full(width, np.nan)
             a = ex.get(n)
             if a is not None:
-                incoming_a[n][row, col[ok]] = a[ok]
+                inc[col] = a[keep]
+            incoming_a[n] = inc
+
+        # UNION mask: a slot is "supplied by this run" if the primary OR any ancillary has data
+        # there. One mask drives every plane, so a stored (value, code) pair can never be
+        # assembled from two different runs — and a code that explains an absent value survives.
+        mask = ~np.isnan(incoming)
+        for n in anc_names:
+            mask |= ~np.isnan(incoming_a[n])
+        dv[row, lo : hi + 1] = _nan_safe(np.where(mask, incoming, existing), dv.dtype)
+        for n in anc_names:
+            merged_a = np.where(mask, incoming_a[n], existing_a[n])
+            anc_vars[n][row, lo : hi + 1] = _nan_safe(merged_a, anc_vars[n].dtype)
+
     if n_before:
         logger.warning('merge %s: %d incoming value(s) predate the axis start and were dropped', variable, n_before)
-
-    # UNION mask: a slot is "supplied by this run" if the primary OR any ancillary has data
-    # there. One mask drives every plane, so a stored (value, code) pair can never be assembled
-    # from two different runs — and a code that exists to explain an absent value survives.
-    mask = ~np.isnan(incoming)
-    for n in anc_names:
-        mask |= ~np.isnan(incoming_a[n])
-    merged = np.where(mask, incoming, existing)
-    dv[:, w_lo : w_hi + 1] = _nan_safe(merged, dv.dtype)
-    for n in anc_names:
-        merged_a = np.where(mask, incoming_a[n], existing_a[n])
-        anc_vars[n][:, w_lo : w_hi + 1] = _nan_safe(merged_a, anc_vars[n].dtype)
     return {
         'new_stations': n_new,
         'new_steps': int(n_new_steps),
-        'written_block': int(width),
+        # WIDEST single station's window, not one global block — the merge no longer has a
+        # single block width. Nothing consumes this field (ingest.py reads only gap_steps); it
+        # is a diagnostic, and per-station is the more useful reading of it anyway: a large
+        # value now means one station genuinely carried a wide window, not that one stale
+        # timestamp stretched the block across every station.
+        'written_block': int(widest),
         'gap_steps': int(gap_steps),
         'qc_rejected': int(n_qc),
         'anc_qc_rejected': int(n_anc_qc),

@@ -307,10 +307,22 @@ encodable range and a junk high code would persist silently.
 Fold a recent window into an **open** ts_ortho dataset (cfdb `Dataset` or `EDataset`, opened `flag='w'`).
 The cadence is read back from the dataset's own envlib attrs and cross-checked against the stored
 axis (epoch-aligned origin, dense constant step — mismatches raise). Appends genuinely-new stations
-and new steps, then does one contiguous read-modify-write over the affected block, writing incoming
-values **only where they are non-NaN** — so a station that is offline this window (or an interval
-that resamples to NaN) is never clobbered. Idempotent for a fixed input window; a window entirely
-before the axis start raises (no history prepending). Returns a small report dict.
+and new steps, then read-modify-writes **one station at a time, each over its own window**, writing
+incoming values **only where they are non-NaN** — so a station that is offline this window (or an
+interval that resamples to NaN) is never clobbered. Idempotent for a fixed input window; a window
+entirely before the axis start raises (no history prepending). Returns a small report dict.
+
+**Memory is bounded by one station's window, not by the point dimension.** This previously read one
+contiguous block spanning *every* station, sized from the global min/max incoming timestamp — so a
+single station reporting one backdated value widened the read for all of them (measured: a routine
+48-step merge went from 6 MB to 552 MB from one stale value). Per-station, a backdated value widens
+only its own row. **Stations that supply nothing this run are not touched at all**, which also means
+they are no longer rewritten — relevant to an `EDataset`, where a rewritten chunk is a pushed chunk.
+
+⚠️ **The store is log-structured, so every merge grows the file** (each reporting station's tail
+chunk is rewritten and the old block orphaned). A continuously-merged dataset needs `ds.prune()` to
+reclaim it — cheap, local-only, and it preserves per-key timestamps so it cannot inflate the next
+push. Prune after publishing.
 
 ```python
 from cfdb import open_dataset
@@ -318,8 +330,11 @@ from envlib_ingest_base import merge_dataset
 
 with open_dataset('flow.cfdb', flag='w') as ds:
     merge_dataset(ds, stations, series_recent, variable='streamflow')
-    # -> {'new_stations': 0, 'new_steps': 24, 'written_block': 72, 'gap_steps': 0,
+    # -> {'new_stations': 0, 'new_steps': 24, 'written_block': 48, 'gap_steps': 0,
     #     'qc_rejected': 0, 'anc_qc_rejected': 0, 'dropped_before_axis': 0}
+    # written_block: the WIDEST single station's window (the merge no longer has one global
+    #            block). A large value now means one station genuinely carried a wide window,
+    #            not that one stale timestamp stretched the block across every station.
     # gap_steps: steps left unfilled behind this window (pipeline downtime) — holes are NaN,
     #            so refetching a wider window and re-merging heals them
     # qc_rejected: values outside the encodable range set to NaN by the min/max QC

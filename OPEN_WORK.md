@@ -13,6 +13,20 @@ not yet proven; remove once the close-check passes) + **backlog**; completed ite
 
 ## Backlog
 
+- [ ] **[ingest] The hourly cron's working cfdb grows without bound — nothing ever calls `prune()`** (found 2026-08-06, following the per-station merge work). booklet is **log-structured**: every chunk rewrite appends a new block and orphans the old one, and the tail chunk of each reporting station is rewritten on *every* run by construction (a partial chunk fills over ~2.85 years at 25,000 hourly steps). `prune()` reclaims it — but **neither `raw/ingest.py` nor this toolkit ever calls it**, and `work = INGEST_DATA_DIR/<name>.cfdb` lives in the **persistent `ecan_data` Docker volume**, so the same file is merged into hourly and never compacted.
+  **Measured** (100 stations × 20,000 steps, simulating the hourly 48-step window):
+
+  | | file size | |
+  |---|---|---|
+  | after build | 6,516,718 B | |
+  | after 1 merge | 12,143,698 B | +86 % |
+  | after 24 merges (one day) | 141,564,161 B | **+2072 %** |
+  | after `prune()` | 6,516,532 B | back to baseline, 2401 items reclaimed |
+
+  Linear at **~5.6 MB per merge**, entirely reclaimable. Note this is **local only** — the remote stores current values, so the pushed dataset is unaffected; it is the working volume that grows.
+  **UNVERIFIED: the actual size of the live volume.** The cron runs on the swarm and the volume is not on this host, so the real-world figure could not be checked — that is the first thing to look at. The per-station merge (above) *reduces* the rate, since stations that report nothing are no longer rewritten, but it does not remove it.
+  **Fix:** call `ds.prune()` periodically — the daily deep-sweep branch (`DEEP_UPDATE_UTC_HOUR`) is the natural hook, since pruning is itself a full rewrite and does not want to run hourly. Decide whether it belongs in `ingest.py` (consumer choice, matches the existing deep-sweep cadence) or in `update_and_publish` (every consumer gets it, but a surprise rewrite inside a publish call).
+
 - [ ] **[toolkit] `merge_dataset` should clamp its own block width — today a consumer guard is the only protection** (found 2026-08-06, dual-blind reviewed in round `chunked-1`; both arms flagged it independently). `merge_dataset` derives `w_lo` from the **global minimum incoming timestamp** across all stations (`tsortho.py:685`) and then reads `dv[:, w_lo:w_hi+1]` across **every point** (`:706`), holding ~6–7 float64 blocks plus masks. **One backdated row from one station widens the block for all of them.** Measured by a review arm on a 100 × 61,000 dataset: a normal 48-step merge peaks at **9 MB**; the same window plus a *single* backdated observation widens the block to 60,900 steps and peaks at **228 MB** — a 25× jump. At streamflow scale (261 × 565k) that extrapolates to **~8 GB inside an hourly cron container**, plus a rewrite of essentially every chunk and the matching upload churn. Not corruption (the union-mask merge is idempotent), but an availability failure.
   **Mitigated at the consumer for now, NOT in the toolkit:** `envlib-ingest-ecan-env/raw/ingest.py` now applies `_assert_within_horizon` to *both* the update and the heal paths (the heal path previously skipped it deliberately — that was the live hole). But a guard living in the caller is backwards: the next consumer inherits none of it, and the toolkit's own docstring claims "no full-remote materialization is required", which is true of the *pull* and misleading about the *block*.
   **Fix — ITERATE BY STATION, don't clamp the width** (revised 2026-08-06 on Mike's design ruling: *everything should iterate by station; a per-station chunk is never too large to hold in RAM*). Clamping was the first idea and it is the worse one — it caps the damage while keeping the all-points read, and it forces an awkward "refuse vs silently narrow" choice.
