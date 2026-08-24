@@ -24,6 +24,7 @@ dependencies = [
   "numpy",
   "shapely>=2.0",
   "sentry-sdk",
+  "booklet>=0.12.10",
 ]
 
 [dependency-groups]
