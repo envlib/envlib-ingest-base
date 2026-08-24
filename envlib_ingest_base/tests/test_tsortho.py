@@ -1186,3 +1186,76 @@ def test_merge_does_not_rewrite_stations_that_reported_nothing(tmp_path):
         'not the code'
     )
     assert not b_row_writes, f'station B reported nothing but its chunks were rewritten: {b_row_writes}'
+
+
+# --- station geometry canonicalisation (cfdb 5-dp WKT round-trip) ---
+#
+# THE 0.3.1 REGRESSION SUITE. cfdb encodes a point coordinate with
+# shapely.to_wkt(..., rounding_precision=5), whose trim=True default rounds the shortest
+# decimal STRING half-to-even; envlib's compute_station_id rounds the underlying BINARY value
+# via wkt.dumps(trim=False). They disagree on ~9% of coordinates given to 6 decimal places, so
+# storing the raw point produced a geometry that no longer derived the station_id stored beside
+# it, and Catalogue.validate rejected the dataset. A live ECan publish failed this way on
+# 2026-08-24. Every other station fixture in this file is 1-dp and blind to it.
+
+SIXDP = (171.1091, -43.631905, 'Lake Emma at East Lake')  # real ECan site 68839
+SIXDP_ID = 'a6394786abaf8a79753b9e64'
+
+
+def _through_a_5dp_store(pt):
+    """What cfdb's Geometry.encode/decode does to a point."""
+    return shapely.from_wkt(shapely.to_wkt(pt, rounding_precision=5))
+
+
+def test_six_dp_station_builds_and_validates(tmp_path):
+    stns = stations_dict({'A': (172.5, -43.5, 'Alpha'), '68839': SIXDP})
+    h = _series({'A': [1.0, 2.0, 3.0, 4.0], '68839': [5.0, 6.0, 7.0, 8.0]})
+    p = tmp_path / 'sf.cfdb'
+    build_local(p, make_meta(), stns, h, **ENC)
+
+    with open_dataset(str(p)) as ds:
+        stored_points = list(ds['point'].data)
+        stored_ids = [str(v) for v in ds['station_id'].data]
+        # the id is the one derived from the SOURCE coordinate — canonicalising must not move it
+        assert stored_ids[1] == SIXDP_ID == envlib.compute_station_id(shapely.Point(*SIXDP[:2]))
+        # ...and every stored geometry still derives its own stored id
+        assert [envlib.compute_station_id(q) for q in stored_points] == stored_ids
+        # the stored point is canonical (5 dp), not the raw 6-dp coordinate
+        assert stored_points[1].y == pytest.approx(-43.63191, abs=1e-9)
+
+    Catalogue(remotes=[], cache=str(tmp_path / 'cache')).validate(str(p))
+
+
+def test_six_dp_station_appended_by_merge_validates(tmp_path):
+    """The production path: an existing dataset gains a 6-dp station on a later run."""
+    stns = stations_dict(STNS_AB)
+    p = tmp_path / 'sf.cfdb'
+    build_local(p, make_meta(), stns, _series({'A': [1.0, 2.0, 3.0, 4.0], 'B': [5.0, 6.0, 7.0, 8.0]}), **ENC)
+
+    with_new = stations_dict({**STNS_AB, '68839': SIXDP})
+    with open_dataset(str(p), flag='w') as ds:
+        report = merge_dataset(ds, with_new, _series({'68839': [9.0, 10.0, 11.0, 12.0]}), variable='streamflow')
+    assert report['new_stations'] == 1
+
+    with open_dataset(str(p)) as ds:
+        stored_ids = [str(v) for v in ds['station_id'].data]
+        assert stored_ids[2] == SIXDP_ID
+        assert [envlib.compute_station_id(q) for q in ds['point'].data] == stored_ids
+
+    Catalogue(remotes=[], cache=str(tmp_path / 'cache')).validate(str(p))
+
+
+def test_raw_six_dp_point_would_not_survive_the_store():
+    """Guards the guard: if this ever passes, the defect is back and the tests above are vacuous."""
+    raw = shapely.Point(*SIXDP[:2])
+    assert envlib.compute_station_id(_through_a_5dp_store(raw)) != SIXDP_ID
+    canonical = envlib.canonical_station_point(raw)
+    assert envlib.compute_station_id(_through_a_5dp_store(canonical)) == SIXDP_ID
+
+
+def test_stations_colliding_at_5dp_are_named(tmp_path):
+    """Two stations in the same ~1 m cell are ONE station_id — say so, don't die in cfdb."""
+    stns = stations_dict({'X': (171.1091, -43.631905, 'One'), 'Y': (171.1091, -43.63191, 'Two')})
+    with pytest.raises(ValueError, match='collapse to the same station_id') as exc:
+        build_local(tmp_path / 'sf.cfdb', make_meta(), stns, _series({'X': [1.0], 'Y': [2.0]}, n=1), **ENC)
+    assert "'X'" in str(exc.value) and "'Y'" in str(exc.value)

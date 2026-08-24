@@ -190,6 +190,15 @@ Version notes: `station_ref` exists in datasets built by toolkit >= 0.1.2 (mergi
 into an older dataset raises — rebuild it — while revise-only merges keep working); the CF attrs
 and `station_altitude` land from toolkit >= 0.1.4.
 
+Station **geometry** is canonicalized through `envlib.canonical_station_point` before it is
+stored, from toolkit >= 0.3.1 (which is why that release floors `envlib>=0.1.4`). Without it, a
+source supplying more than 5 decimal places of longitude/latitude could write a point that cfdb
+re-rounds on the way in, leaving a stored geometry that no longer derives the stored `station_id`
+— a dataset that then fails `publish()` forever. Ids are unaffected, so this changed nothing for
+stations already stored; datasets built by earlier toolkits need no rebuild. Two stations that
+round to the same point (within ~1 m) are now rejected at build with both refs named, instead of
+dying inside cfdb's coordinate-uniqueness check.
+
 **The envlib metadata is the single source of truth for the cadence** — there is no `freq`
 parameter. `frequency_interval` is a closed envlib vocabulary; only *fixed* codes work here
 (`1min`…`30min`, `1h`…`12h`, `day` — `month`/`year`/`None` raise, a dense axis needs a fixed

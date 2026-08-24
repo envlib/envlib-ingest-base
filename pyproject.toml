@@ -13,7 +13,10 @@ dependencies = [
   # Released PyPI stack only - ingest repos are arm's-length consumers.
   # Deliberately pandas-free: the API is numpy tuples/dicts (pandas objects still
   # work as *inputs* by duck-typing).
-  "envlib>=0.1.3",
+  # >=0.1.4 is a HARD floor, not hygiene: tsortho calls envlib.canonical_station_point,
+  # which does not exist before 0.1.4 — an older envlib makes EVERY ts_ortho build and
+  # merge die with AttributeError in _points_ids_names.
+  "envlib>=0.1.4",
   # >=0.9.4 is a HARD floor: older cfdb fabricates values when its packed encoder meets
   # NaN/out-of-range data (cfdb changelog 0.9.4); tsortho also enforces this at runtime.
   "cfdb>=0.9.4",

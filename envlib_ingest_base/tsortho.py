@@ -391,10 +391,50 @@ def _write_rows(var, stations: dict, series: dict, t0_us: int, n_times: int, ste
 
 
 def _points_ids_names(stations: dict):
-    points = [shapely.Point(float(d['lon']), float(d['lat'])) for d in stations.values()]
+    """Station geometry + labels, in ``stations`` order.
+
+    The points are CANONICALISED (``envlib.canonical_station_point``) before they leave this
+    function, and that is not cosmetic: cfdb stores a point coordinate by encoding it with
+    ``shapely.to_wkt(..., rounding_precision=5)``, whose ``trim=True`` default rounds the
+    shortest decimal string half-to-even, while ``compute_station_id`` rounds the binary value
+    via ``wkt.dumps`` (``trim=False``). They disagree on ~9% of coordinates supplied to 6
+    decimal places, so writing the RAW point stores a geometry that no longer derives the
+    ``station_id`` written beside it and the dataset can never be published — which is exactly
+    how a live ECan publish failed on 2026-08-24. Canonicalising first makes the store's
+    round-trip a fixed point. Ids are unaffected (the canonical point is what they already
+    hashed), so this changes nothing for any station already stored.
+    """
+    points = [
+        envlib.canonical_station_point(shapely.Point(float(d['lon']), float(d['lat'])))
+        for d in stations.values()
+    ]
     ids = np.array([envlib.compute_station_id(p) for p in points], dtype=object)
     names = np.array([str(d['name']) for d in stations.values()], dtype=object)
     refs = np.array([str(r) for r in stations], dtype=object)
+
+    # Two stations inside the same ~1 m 5-dp cell collapse to ONE station_id. That is the
+    # id contract, not a defect here — but it must be said out loud. Without this, the build
+    # dies in cfdb's coord-uniqueness check ('The data for coords must be unique.'), which
+    # names neither station, and before canonicalisation it did something worse: wrote two
+    # rows carrying the same id and failed much later inside catalogue validation.
+    if len(set(ids)) != len(ids):
+        seen: dict = {}
+        clashes = []
+        for ref, sid, p in zip(refs, ids, points, strict=True):
+            if sid in seen:
+                first_ref, first_p = seen[sid]
+                clashes.append(
+                    f'{first_ref!r} ({first_p.x}, {first_p.y}) and {ref!r} ({p.x}, {p.y}) -> {sid}'
+                )
+            else:
+                seen[sid] = (ref, p)
+        msg = (
+            'stations collapse to the same station_id (identical to 5 decimal places, ~1 m): '
+            + '; '.join(clashes)
+            + '. A station_id IS its rounded location, so these are one station to envlib — '
+            'drop one, or correct the coordinates if they are wrong.'
+        )
+        raise ValueError(msg)
     return points, ids, names, refs
 
 
@@ -683,6 +723,11 @@ def merge_dataset(ds, stations: dict, series: dict, *, variable: str):
     active = list(non_empty)
     sub = {r: stations[r] for r in active}
     points, ids, names, refs = _points_ids_names(sub)
+    # ONE derivation per station per merge, reused by the write loop below. That loop used to
+    # recompute the id from stations[ref] independently, which meant the store path and the
+    # row-lookup path each had their own spelling of "the id for this station" and nothing
+    # forced them to agree.
+    ref_to_sid = dict(zip(refs, ids, strict=True))
     # validated up front, BEFORE any row mutation: a junk/non-finite altitude then raises
     # pre-append (never leaving a half-written station row), and the check is uniform — merge
     # is as loud on bad altitude as build, regardless of new-vs-existing or var presence.
@@ -753,9 +798,7 @@ def merge_dataset(ds, stations: dict, series: dict, *, variable: str):
     n_before = 0
     widest = 0
     for ref, (t, v, ex) in non_empty.items():
-        d = stations[ref]
-        sid = envlib.compute_station_id(shapely.Point(float(d['lon']), float(d['lat'])))
-        row = id_to_row[sid]
+        row = id_to_row[ref_to_sid[ref]]
         col_abs = _step_index(t, t0, step_us)
         n_before += int((col_abs < 0).sum())  # window straddles the axis start: pre-axis values
         keep = col_abs >= 0
