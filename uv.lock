@@ -60,16 +60,16 @@ wheels = [
 
 [[package]]
 name = "booklet"
-version = "0.12.9"
+version = "0.12.10"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "orjson" },
     { name = "portalocker" },
     { name = "uuid6" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/9d/bc/5abf1dfcbcd533b44d4eb957a553e9b983af59beda708d54f82aac7a9777/booklet-0.12.9.tar.gz", hash = "sha256:a80b4fd8fa855db2b82161be128c75f970360b40584d5ca0b2efc34de47d2f12", size = 39645, upload-time = "2026-07-21T08:44:48.755Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/2f/c8/3911be82f3c3f231b97f7f2acceb4462daf37fe5f7117963d3e821a47262/booklet-0.12.10.tar.gz", hash = "sha256:5a8a5637303daab8ff40a7458d0ba02eb43fea140556bfb3c1582828fc923cc6", size = 40063, upload-time = "2026-08-24T22:22:19.921Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/a6/e0/f45201d6d81738612378300f42504780ea426cc91d260e5d38261647d2cd/booklet-0.12.9-py3-none-any.whl", hash = "sha256:058e685d824122f3a07d0a1a703ee08c9c84c6d1a2322f627baacea1ab82c43a", size = 41721, upload-time = "2026-07-21T08:44:47.076Z" },
+    { url = "https://files.pythonhosted.org/packages/5b/fe/7c0966bc0a7b09f9bc10705d1ce52a20967bb269f70a451c216b3ad9d35b/booklet-0.12.10-py3-none-any.whl", hash = "sha256:b7e34911320aa283e3b490534969053fd48ae8234ef0969e57bc9f293c63d10d", size = 41938, upload-time = "2026-08-24T22:22:18.646Z" },
 ]
 
 [[package]]
@@ -187,6 +187,7 @@ wheels = [
 name = "envlib-ingest-base"
 source = { editable = "." }
 dependencies = [
+    { name = "booklet" },
     { name = "cfdb" },
     { name = "ebooklet" },
     { name = "envlib" },
@@ -209,6 +210,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "booklet", specifier = ">=0.12.10" },
     { name = "cfdb", specifier = ">=0.9.4" },
     { name = "ebooklet", specifier = ">=0.10.3" },
     { name = "envlib", specifier = ">=0.1.4" },
