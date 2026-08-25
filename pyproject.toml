@@ -16,7 +16,11 @@ dependencies = [
   # >=0.1.4 is a HARD floor, not hygiene: tsortho calls envlib.canonical_station_point,
   # which does not exist before 0.1.4 — an older envlib makes EVERY ts_ortho build and
   # merge die with AttributeError in _points_ids_names.
-  "envlib>=0.1.5",
+  # >=0.1.6 is a HARD floor: tsforecast calls envlib.validate_dataset, the public catalogue-free
+  # validation entry point, which does not exist before it. Raised in the SAME commit as the code
+  # that needs it -- 0.1.5 satisfies the old ">=0.1.5" floor, so an in-place upgrade would keep it
+  # and the failure would surface as an AttributeError far from its cause.
+  "envlib>=0.1.6",
   # >=0.9.4 is a HARD floor: older cfdb fabricates values when its packed encoder meets
   # NaN/out-of-range data (cfdb changelog 0.9.4); tsortho also enforces this at runtime.
   "cfdb>=0.9.5",
