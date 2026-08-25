@@ -16,10 +16,10 @@ dependencies = [
   # >=0.1.4 is a HARD floor, not hygiene: tsortho calls envlib.canonical_station_point,
   # which does not exist before 0.1.4 — an older envlib makes EVERY ts_ortho build and
   # merge die with AttributeError in _points_ids_names.
-  "envlib>=0.1.4",
+  "envlib>=0.1.5",
   # >=0.9.4 is a HARD floor: older cfdb fabricates values when its packed encoder meets
   # NaN/out-of-range data (cfdb changelog 0.9.4); tsortho also enforces this at runtime.
-  "cfdb>=0.9.4",
+  "cfdb>=0.9.5",
   "ebooklet>=0.10.3",
   "numpy",
   "shapely>=2.0",
