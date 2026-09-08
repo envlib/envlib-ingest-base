@@ -11,7 +11,7 @@ from envlib_ingest_base.tsforecast import build_and_push, merge_run, update_and_
 from envlib_ingest_base.tsforecast import build_local as build_forecast_local
 from envlib_ingest_base.tsortho import build_and_publish, build_local, merge_dataset, update_and_publish
 
-__version__ = '0.4.0'
+__version__ = '0.4.1'
 __all__ = [
     'build_and_publish',
     'build_and_push',
