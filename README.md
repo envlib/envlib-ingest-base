@@ -399,7 +399,9 @@ the right choice for continuously-updated ts_ortho datasets (tens of keys; every
 push/pull moves exactly the changed chunk and nothing else). Grouped storage is a
 request-batching optimization for **large, rarely-updated archives** (thousands of keys —
 ebooklet's guidance is 10–100 MB per group); pass a prime `num_groups` at first publish only
-for that shape. The choice is fixed once the dataset is first pushed.
+for that shape. The choice is fixed once the dataset is first pushed. For how chunk size and shape
+trade off on each layout (request costs, per-station vs multi-station chunks), see cfdb's
+[Chunk sizes for remote datasets](https://mullenkamp.github.io/cfdb/guide/s3-remote/#chunk-sizes-for-remote-datasets).
 
 `build_and_publish` takes the same keyword build args as `build_local`
 (`variable`/`units`/`precision`/`min_value`/`max_value`/`standard_name`/…); `update_and_publish` only
@@ -431,7 +433,7 @@ docker compose push
 
 The image installs the **released package from PyPI** (`TOOLKIT_VERSION` build arg) — the
 package's own pyproject is the single source of truth for dependencies, so there are no
-separately-maintained requirements files to drift out of sync (the cfdb >= 0.9.4 floor rides in
-via `requires_dist`). The image is pandas-free, like the toolkit: downstream repos build `FROM`
+separately-maintained requirements files to drift out of sync (the cfdb floor in `pyproject.toml`
+rides in via `requires_dist`). The image is pandas-free, like the toolkit: downstream repos build `FROM`
 this image and install their own extra runtime deps (e.g. the ECan repo adds pandas for its CSV
 fetch layer).

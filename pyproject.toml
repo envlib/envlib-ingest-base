@@ -20,10 +20,14 @@ dependencies = [
   # validation entry point, which does not exist before it. Raised in the SAME commit as the code
   # that needs it -- 0.1.5 satisfies the old ">=0.1.5" floor, so an in-place upgrade would keep it
   # and the failure would surface as an AttributeError far from its cause.
-  "envlib>=0.1.6",
+  "envlib>=0.1.7",
   # >=0.9.4 is a HARD floor: older cfdb fabricates values when its packed encoder meets
   # NaN/out-of-range data (cfdb changelog 0.9.4); tsortho also enforces this at runtime.
-  "cfdb>=0.9.5",
+  # >=0.10.0: cfdb 0.10 writes byte-shuffled compression (zstd_shuffle) by default, which an older
+  # cfdb cannot open. The toolkit also READS existing datasets (update/merge paths pull the remote),
+  # so it must be able to open whatever another producer on 0.10 published. Existing datasets keep
+  # their recorded compression when updated; only newly built ones are shuffled.
+  "cfdb>=0.10.0",
   "ebooklet>=0.10.5",
   "numpy",
   "shapely>=2.0",
