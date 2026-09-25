@@ -9,7 +9,7 @@ not yet proven; remove once the close-check passes) + **backlog**; completed ite
 
 ## Verification debts
 
-- [ ] **[ingest] cfdb 0.10.0 (shuffle compression by default) is in all three ingest locks but in no image yet** (added 2026-09-24). Any base-image rebuild now pulls it from PyPI. Roll out readers before writers, because a new dataset built by 0.10 cannot be opened by an older cfdb. Toolkit **0.4.2** (staged 2026-09-24, not released) floors `cfdb>=0.10.0`; rebuild the image on it once it is on PyPI. The rollout order and close-check are in the stack tracker: `~/git/envlib-repos/envlib/OPEN_WORK.md`, first verification debt.
+- [ ] **[ingest] cfdb 0.10.0 (shuffle compression by default) is in all three ingest locks but in no image yet** (added 2026-09-24). Any base-image rebuild now pulls it from PyPI. Roll out readers before writers, because a new dataset built by 0.10 cannot be opened by an older cfdb. Toolkit **0.4.2** floors `cfdb>=0.10.0` and is on PyPI (verified 2026-09-25); rebuild the image on it. The rollout order and close-check are in the stack tracker: `~/git/envlib-repos/envlib/OPEN_WORK.md`, first verification debt.
 - [ ] **[ingest/graphql] The ECan GraphQL backfill is PARTIAL — resume after the quota reset on 2026-10-11** (`envlib-ingest-ecan-env/graphql/`, cache `~/data/ecan-graphql/`). The real quota (ECan by email 2026-09-14) is **976.56 MB of gzipped transfer per period + 50k calls**, not 10 GB; the whole backfill is ~1.8 GB wire. `backfill-1` (2026-09-14) covered 242 of 342 sites for 776 MB; `backfill-1b` spent 50 MB more with ~37 MB held in reserve. **On/after 2026-10-11:** `PYTHONPATH=.:graphql uv run python graphql/fetch.py --label backfill-2` from the ecan-env repo root (settled years are skipped; it stops at 0.9 × quota). `--dry-run` on 2026-09-14 projects the remainder at **~3 300 calls / ~650 MB wire — it fits the October period**, with ~230 MB to spare for Mike's reserve. Close-check: every site's manifest `status: complete` with a `record_start`, ledger totals agree with the run records, `probe.py` over the whole cache shows no errors and the same grid/code properties as the 3-station test; record each run in `graphql/PROVENANCE.md` and re-sync the Mega copy.
 - [ ] **[ingest/graphql] The node-cap and quota error shapes are UNMEASURED by decision** (no deliberate over-cap or burst requests — Mike, 2026-09-14: keep endpoint testing minimal). `source.classify` treats a size-limit-worded `errors[]` as the cap and bisects; a 403/429 with quota wording stops cleanly (the quota is real: 976.56 MB wire per period, so a run that ignores the ledger WILL hit it). Close-check: the first time either occurs in a real run, confirm the branch taken from the manifest/run record and pin the exact message in `source.py`.
 
@@ -24,6 +24,14 @@ not yet proven; remove once the close-check passes) + **backlog**; completed ite
 
 ## Backlog
 
+- [ ] **[ingest/wrf-3k] Follow-ups to the published WRF 3 km precipitation** (added 2026-09-25):
+  - **Extend back to 1980:** `build.py --start 1980-01-01 --end 1990-06-30T23:00`, update `config.ERA5_YEARS`, then `verify_build` → `publish` → `verify_remote`. This re-uploads ~all groups.
+  - **Other variables:** add them as separate datasets.
+  - **Optional `verify_build` speed-ups** (full-archive run ≈ 1 h on a network drive):
+    - #6 reads frames by index list rather than a slice;
+    - #6 is single-threaded (parallel reads would help);
+    - #4 and #6 each stream the stored chunks, so they could share one pass.
+  - **The repo is uncommitted** (Mike to review and commit).
 - [x] ~~**[ingest/graphql] LICENSING RULING before anything GraphQL-sourced is published**~~ — **RULED 2026-09-14 (Mike): ECan's monitoring data is CC-BY-4.0** as declared through its open-data listing (Stats NZ); the API platform's Terms of Use (verbatim in `envlib-ingest-ecan-env/graphql/PROVENANCE.md`) are platform-access terms, not the data licence. GraphQL-sourced datasets carry the same `license`/`attribution` as the other tracks.
 - [ ] **[ingest/qa] The tethys QC STREAMFLOW snapshot has a 1-hour DST shift in summer and carries raw-system values** (2026-09-14, `graphql/reports/tethys-diff-68801.md`, verified two ways — against GraphQL and against the DST-verified raw twin; details in `graphql/PROVENANCE.md`). Bears on α3: the other five tethys QC datasets were exported the same way and are UNCHECKED. Close-check for each: a season-split lag scan against its raw twin (`diff_tethys.py`'s § 5 generalised) before any of them is published as `quality_controlled`. The `qa/PROVENANCE.md` "lag-0 evidence" was a single all-months scan and cannot see this.
 - [x] ~~**[ingest/graphql] Second copy of the GraphQL cache**~~ — **DONE + VERIFIED 2026-09-15**: Mike rclone'd it to Mega S4 `mega_hh_r:/data/ecan-graphql/`; `rclone check --download` 4 571/4 571 matching, and all 4 302 local pages re-hashed clean against their manifest `body_sha256`. Re-sync + re-check after every fetch run (commands in `graphql/PROVENANCE.md` § Cache).
@@ -49,6 +57,16 @@ not yet proven; remove once the close-check passes) + **backlog**; completed ite
 
 ## Done (newest first)
 
+- [x] ~~**[ingest/wrf-3k] WRF 3 km NZ hindcast hourly precipitation → the commons**~~ — **PUBLISHED + VERIFIED 2026-09-25** (`envlib-ingest-wrf-3k`; dvid `ce70c73d9bbbb56590b2b254`; `owner=uc`, `product_code=wrf-3km-nz`, CC-BY-4.0).
+  - **The build:** Mike ran it on the university machine, 1990-07-01T00 → 2025-06-30T23 (306,816 hours; 11.5 GB; 1999 groups). `verify_build` PASS with live checks (about an hour, mostly gate #6 re-reading PREC_ACC from the network drive).
+  - **The publish:** ~50 MB/s upload.
+  - **`verify_remote` PASS:**
+    - a bare `Catalogue()` query returns the entry with the full range and the antimeridian-crossing bbox;
+    - spatial queries work on both sides of 180°;
+    - 966 chunks (3 whole bands) are byte-equal through the public URL, in 34 s;
+    - fsck: member 1999 objects and catalogue 3, 0 orphans, 0 missing.
+  - **Enabled by:** cfdb-ingest 0.6.0 + cfdb-vars 0.2.5 (the WPS-sphere CRS, grid `extend`, interval-start labels, chunk-aligned writes).
+  - **Reviews:** plan and code rounds `wrf3k-ingest-plan-1` / `wrf3k-ingest-code-1`, three arms each. The gate catches 17/17 planted defects; 10/10 re-applied mutants are flagged; a scratch push/extend/re-push cycle ran on the real bucket.
 - [x] ~~**[toolkit+ingest] `merge_dataset` iterates BY STATION, and the cron now prunes**~~ — **DONE 2026-08-06, shipped in 0.3.0.** Two items that were on this backlog, both closed together with the build fix below.
   **(a) `merge_dataset` per-station.** It read `dv[:, w_lo:w_hi+1]` across *every* point, with bounds from the GLOBAL min/max incoming timestamp — so one station's backdated value widened the read for all of them. The first idea was to clamp the width; Mike's ruling (*everything should iterate by station; a per-station chunk is never too large to hold in RAM*) gave the better fix, and it turned out to be simply correct: the union mask is elementwise and `incoming[row]` only carries data for the station at `row`, so there is **no cross-station dependency**. Each station now reads, merges and writes its own window.
   **Measured** (150 stations × 60,000 steps): a routine 48-step merge peaks at 6.0 MB either way; the same window **plus one backdated observation** was **552.5 MB** before and **6.0 MB** after. Data identical across 7 differential scenarios (disjoint per-station windows, one backdated station, an offline station, ancillary/union-mask, axis extension, two sequential merges). **Second win:** stations that report nothing are no longer rewritten — proven by test (`station B reported nothing but its chunks were rewritten: ['streamflow!1.0']` against the old code) — which cuts both file growth and pushed chunks. Files came out 10–14 % smaller in the wide-window scenarios. `written_block` now means the **widest single station's window**; nothing consumes it (`ingest.py` reads only `gap_steps`).
