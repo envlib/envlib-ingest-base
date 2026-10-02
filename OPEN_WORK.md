@@ -15,47 +15,65 @@ not yet proven; remove once the close-check passes) + **backlog**; completed ite
 ## Backlog
 
 - [ ] **[ingest/wrf-3k] Follow-ups to the published WRF 3 km precipitation** (added 2026-09-25):
-  - **Extend back to 1980:** `build.py --start 1980-01-01 --end 1990-06-30T23:00`, update `config.ERA5_YEARS`, then `verify_build` → `publish` → `verify_remote`. This re-uploads ~all groups.
-  - **Other variables: needed by thalweg step 0** (added 2026-10-02; consumer: `thalweg-repos/thalweg`,
-    its step-0 plan). Build them as separate full-domain datasets under **their own plan and review round**;
-    thalweg only states what it requires:
-    - **Hourly, instantaneous at the frame time:** `T2`, `Q2`, `PSFC`, `WIND10`, `SWDOWN`, `GLW`, `QFX`.
-      All are existing cfdb-ingest keys (`cfdb_ingest/wrf.py`). Publish them as WRF wrote them (to packing
-      precision), with the instantaneous semantics declared in the metadata. thalweg does its own
-      time-averaging (trapezoid to period-ending hourly means).
-    - **Hourly too:** `SNOW` (SWE) and `SMOIS` (soil moisture; `DZS` becomes its depth coordinate), for the
-      water-year storage cycle.
-    - **Static, once:** `HGT` and `XLAND`.
-    - **Period:** 1990-07-01T00 → **2025-07-01T00** inclusive. The extra final frame lets the last hour be averaged.
-    - **Grid:** the same native d03 grid and CRS attributes as the precipitation dataset, from the same CRS
-      resolver (thalweg's area-weight table depends on that).
-    - **Corrections from review `thalweg-step0-plan-1` (2026-10-02; `thalweg/docs/reviews/thalweg-step0-plan-1.md`),
-      checked on the 1990 subset files:**
-      - `U10`/`V10` are earth-rotated by cfdb-ingest and refused when the files carry no `COSALPHA`/`SINALPHA`
-        (the surface-variable extract has neither). `WIND10` (speed) converts and is all ETo needs.
-      - The extract has no `HGT`; take it from a full d03 file. `LANDMASK` is not a cfdb-ingest key (the mask
-        key is `XLAND`), and `XLAT`/`XLONG` are not keys at all (they fit the x/y axes).
-      - cfdb-ingest writes no label attribute for instantaneous fields today (only accumulations get
-        `interval_start` / `cell_methods`), so the "instantaneous at frame time" declaration needs adding.
-      - `PSFC` and `HGT` pack to 4 bytes in cfdb-vars (`uint32`), so their size is about double the 2-byte
-        variables' (about 100 GB raw per 2-byte hourly variable on the full domain).
-      - cfdb-ingest cannot write a daily-only dataset (extend mode steps at the smallest input spacing), and
-        `SMOIS` cannot share a `squeeze_height` call with surface fields.
-      - Negative `Q2`, `SWDOWN`, `GLW` or `SNOW` values raise unless `clip_nonneg=True`; decide which.
-      - Not every variable is needed first: thalweg's water-balance gate needs only P (published), `QFX`,
-        `SNOW` and `SMOIS`; the ETo inputs are needed for step 1.
-    - **Open for that plan:** whether to also publish the accumulators (`ACLHF`, `ACSWDNB`, …). They need
-      weekly-seam handling that cfdb-ingest lacks.
-  - **Optional `verify_build` speed-ups** (full-archive run ≈ 1 h on a network drive):
+  - **Other variables (for thalweg step 0): BUILT, REVIEWED, STAGED; next, Mike commits, then production**
+    (status 2026-10-03).
+    - **What:** 11 more datasets in `envlib-ingest-wrf-3k`, one variable each, on the precipitation's grid and
+      CRS:
+      - hourly instantaneous: temperature, specific humidity, surface pressure, wind speed, wind direction,
+        shortwave down, longwave down, moisture flux;
+      - daily at 00 UTC: snow water equivalent, soil moisture (4 layers);
+      - static: the run-time terrain.
+    - **Where the values live:** `config.DATASETS` holds every value; the README table gives kinds, ranges
+      and chunks. The plan is `~/.claude/plans/please-read-home-mike-git-envlib-repos-i-eager-island.md`.
+    - **How it was built:**
+      - Stage A is cfdb-ingest 0.8.0 + cfdb-vars 0.2.8, RELEASED and verified on PyPI (round
+        `cfdb-ingest-080-code-1`).
+      - Stage B (multi-dataset registry, `--dataset` required, the exact-compare gate) was reviewed in rounds
+        `wrf3k-vars-plan-1` and `wrf3k-vars-code-1`. The records and syntheses are in
+        `ai-review-harness/results/<round>/`.
+    - **Proven on the 1990-07..12 sample:**
+      - all 12 datasets build and pass `verify_build`; every instantaneous value equals its source (0 of
+        742,815,360 per hourly field);
+      - the plant harness gives 30/30 (`dev/plants.py`);
+      - the precipitation refactor: stored keys byte-equal to HEAD's except `history`;
+      - a scratch push → remote-handle extension → public read-back (644/644 chunks) → fsck → delete cycle on
+        the real bucket passed.
+    - **Deviations from thalweg's request** (Mike's rulings, 2026-10-02; pointer in `thalweg/OPEN_WORK.md`):
+      - SNOW/SMOIS are daily, not hourly;
+      - no XLAND/LANDMASK;
+      - specific humidity, not mixing ratio (a negative Q2 is clipped to 0, and the gate counts them);
+      - wind direction added.
+    - **Reader notes for thalweg:**
+      - SWDOWN is valid ~15 min before its label; GLW is the call 30 min before;
+      - SMOIS = 1 marks water and glacier cells;
+      - depth = layer bottoms;
+      - query the static terrain without a time window, and do not use terrain > 0 as a land mask (coastal
+        sea cells reach ~300 m).
+    - **Verification debts, to close at production:**
+      - `verify_remote.py`'s catalogue steps (need a real entry: the first publish);
+      - full-record runs on the university machine (gate peak ~3 GB on barometric pressure; a daily band opens
+        360 files);
+      - #9 and the direction-geography check calibrated on Jul-Dec 1990 only;
+      - the GMTED2010 licence wording (USGS public domain, to confirm).
+    - **Production:** build → verify_build → publish → verify_remote per dataset, `altitude` and the daily ones
+      first. Ranges per the README table: hourly `--end 2025-07-01T00:00`, daily `--end 2025-07-01`.
+    - **Backlog from this work:**
+      - LANDMASK as a declared ancillary variable of the terrain dataset;
+      - earth-relative u/v datasets;
+      - `preflight.py` should delegate its companion-grid check to `WrfIngest(..., static_path=)` and derive
+        its variable lists from `verify_build.GATE`;
+      - a cfdb-ingest `only_variable` option (in `envlib/OPEN_WORK.md`).
+  - **Extend back to 1980:** now for every dataset, with the "1980s prepend" ranges in the README table. Update
+    `config.ERA5_YEARS`, then `verify_build` → `publish` → `verify_remote`. This re-uploads ~all groups. The
+    static terrain is already stamped 1980-01-01.
+  - **Optional `verify_build` speed-ups** (precipitation; full-archive run ≈ 1 h on a network drive):
     - #6 reads frames by index list rather than a slice;
     - #6 is single-threaded (parallel reads would help);
     - #4 and #6 each stream the stored chunks, so they could share one pass.
-  - **`PROVENANCE.md` does not say the published `PREC_ACC` values were backfilled offline** (found
-    2026-10-02). They were derived by `wrf-runs/projects/wrf_3k/v33_3km_6d/backfill_prec_acc.py` from
-    RAINNC/RAINC bucket differences plus wrfxtrm at the weekly seams. The source files' `PREC_ACC_BACKFILL`
-    and `derivation` attributes record it; PROVENANCE and the dataset description do not. Close-check: add it
-    to PROVENANCE, and confirm every file in the archive is backfilled. Only the local files were checked;
-    weeks rerun with native `prec_acc_dt` would differ by design at one frame per week.
+  - **The published `PREC_ACC` was backfilled offline** (`wrf-runs/projects/wrf_3k/v33_3km_6d/backfill_prec_acc.py`;
+    the files' `PREC_ACC_BACKFILL` / `derivation` attributes). PROVENANCE now says so (staged 2026-10-02).
+    Remaining close-check: confirm every archive file is backfilled. Only the local files were checked; weeks
+    rerun with native `prec_acc_dt` differ by design at one frame per week.
 - [ ] **[ingest/qa] The tethys QC STREAMFLOW snapshot has a 1-hour DST shift in summer and carries raw-system values** (2026-09-14, `graphql/reports/tethys-diff-68801.md`, verified two ways — against GraphQL and against the DST-verified raw twin; details in `graphql/PROVENANCE.md`). Bears on α3: the other five tethys QC datasets were exported the same way and are UNCHECKED. Close-check for each: a season-split lag scan against its raw twin (`diff_tethys.py`'s § 5 generalised) before any of them is published as `quality_controlled`. The `qa/PROVENANCE.md` "lag-0 evidence" was a single all-months scan and cannot see this.
 - [ ] **[ingest/graphql] Build plan for the GraphQL datasets** (hourly `ecan-streamflow-qc` + native 15-min; the latter needs the toolkit `statistic='point'` engine below). **thalweg is a consumer (added 2026-10-02, review `thalweg-step0-plan-1`):** it needs the hourly QC streamflow for 68810, 69302, 69505 and 70105 (from 1990-07-01 only; the 1980s are a sealed holdout), the interval label as a machine-readable attribute (today it is free text in the description), the per-hour quality code, a build that reads the **pinned as-of cache** (so thalweg's cache-route and dataset-route values agree as packed integers), and a dated version per build. Note for the code spec: the resampler's minimum-code-per-hour lets one 200 reading hide a 300 in the same hour. Inputs settled by the extraction: verbatim cache, `resample_station` + `hourly_min_code`, `cache.latest_pages(--as-of)`. Open inputs: the coordinate audit (7 raw-twin sites sit > 200 m from their reprojected NZTM — 68801 by 743 m, 70601 by 167 km); refresh strategy (code `200` spans 68801's whole record, so "refresh the sub-600 years" is the whole record; the merge cannot retract); whether `qa/`'s streamflow leg is superseded (the diff says the snapshot is not the QA record).
 
