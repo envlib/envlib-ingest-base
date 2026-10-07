@@ -394,12 +394,12 @@ update_and_publish(cat, 'flow.cfdb', member, rcg, stations, series_recent,
                    variable='streamflow')
 ```
 
-**Remote storage layout**: by default (`num_groups=None`) each chunk is its own S3 object —
+**Remote storage layout**: by default (`group_bytes=None`) each chunk is its own S3 object —
 the right choice for continuously-updated ts_ortho datasets (tens of keys; every hourly
-push/pull moves exactly the changed chunk and nothing else). Grouped storage is a
-request-batching optimization for **large, rarely-updated archives** (thousands of keys —
-ebooklet's guidance is 10–100 MB per group); pass a prime `num_groups` at first publish only
-for that shape. The choice is fixed once the dataset is first pushed. For how chunk size and shape
+push/pull moves exactly the changed chunk and nothing else). Grouped storage (`group_bytes=<int>`,
+ebooklet ≥ 0.11) packs chunks in write order into group objects of up to that many bytes; it suits
+**large archives**, including ones that grow by appending (an append uploads the new chunks plus at
+most one partly filled group). The choice is fixed once the dataset is first pushed. For how chunk size and shape
 trade off on each layout (request costs, per-station vs multi-station chunks), see cfdb's
 [Chunk sizes for remote datasets](https://mullenkamp.github.io/cfdb/guide/s3-remote/#chunk-sizes-for-remote-datasets).
 

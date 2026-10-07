@@ -15,48 +15,46 @@ not yet proven; remove once the close-check passes) + **backlog**; completed ite
 ## Backlog
 
 - [ ] **[ingest/wrf-3k] Follow-ups to the published WRF 3 km precipitation** (added 2026-09-25):
-  - **Other variables (for thalweg step 0): BUILT, REVIEWED, STAGED; next, Mike commits, then production**
-    (status 2026-10-03).
-    - **What:** 11 more datasets in `envlib-ingest-wrf-3k`, one variable each, on the precipitation's grid and
-      CRS:
-      - hourly instantaneous: temperature, specific humidity, surface pressure, wind speed, wind direction,
-        shortwave down, longwave down, moisture flux;
-      - daily at 00 UTC: snow water equivalent, soil moisture (4 layers);
-      - static: the run-time terrain.
-    - **Where the values live:** `config.DATASETS` holds every value; the README table gives kinds, ranges
-      and chunks. The plan is `~/.claude/plans/please-read-home-mike-git-envlib-repos-i-eager-island.md`.
-    - **How it was built:**
-      - Stage A is cfdb-ingest 0.8.0 + cfdb-vars 0.2.8, RELEASED and verified on PyPI (round
-        `cfdb-ingest-080-code-1`).
-      - Stage B (multi-dataset registry, `--dataset` required, the exact-compare gate) was reviewed in rounds
-        `wrf3k-vars-plan-1` and `wrf3k-vars-code-1`. The records and syntheses are in
-        `ai-review-harness/results/<round>/`.
-    - **Proven on the 1990-07..12 sample:**
-      - all 12 datasets build and pass `verify_build`; every instantaneous value equals its source (0 of
-        742,815,360 per hourly field);
-      - the plant harness gives 30/30 (`dev/plants.py`);
-      - the precipitation refactor: stored keys byte-equal to HEAD's except `history`;
-      - a scratch push → remote-handle extension → public read-back (644/644 chunks) → fsck → delete cycle on
-        the real bucket passed.
-    - **Deviations from thalweg's request** (Mike's rulings, 2026-10-02; pointer in `thalweg/OPEN_WORK.md`):
-      - SNOW/SMOIS are daily, not hourly;
-      - no XLAND/LANDMASK;
-      - specific humidity, not mixing ratio (a negative Q2 is clipped to 0, and the gate counts them);
-      - wind direction added.
-    - **Reader notes for thalweg:**
-      - SWDOWN is valid ~15 min before its label; GLW is the call 30 min before;
-      - SMOIS = 1 marks water and glacier cells;
-      - depth = layer bottoms;
-      - query the static terrain without a time window, and do not use terrain > 0 as a land mask (coastal
-        sea cells reach ~300 m).
-    - **Verification debts, to close at production:**
-      - `verify_remote.py`'s catalogue steps (need a real entry: the first publish);
-      - full-record runs on the university machine (gate peak ~3 GB on barometric pressure; a daily band opens
-        360 files);
-      - #9 and the direction-geography check calibrated on Jul-Dec 1990 only;
-      - the GMTED2010 licence wording (USGS public domain, to confirm).
-    - **Production:** build → verify_build → publish → verify_remote per dataset, `altitude` and the daily ones
-      first. Ranges per the README table: hourly `--end 2025-07-01T00:00`, daily `--end 2025-07-01`.
+  - **Other variables (for thalweg step 0): ALL 12 DATASETS PUBLISHED** (Mike, finished 2026-10-06; status as
+    of then). The 11 new ones sit beside the precipitation in `envlib-ingest-wrf-3k`, one variable each, on its grid
+    and CRS: hourly instantaneous temperature, specific humidity, surface pressure, wind speed and direction,
+    shortwave and longwave down, moisture flux; daily (00 UTC) snow water equivalent and 4-layer soil moisture; the
+    static run-time terrain. `config.DATASETS` holds every value; the README table gives kinds, timestamps, storage
+    and chunks; PROVENANCE holds the reasoning.
+    - **How it got here:** cfdb-ingest 0.8.0 + cfdb-vars 0.2.8 (round `cfdb-ingest-080-code-1`); the multi-dataset
+      registry (rounds `wrf3k-vars-plan-1`, `wrf3k-vars-code-1`; plan archived at
+      `~/git/ai-review-harness/results/wrf3k-vars-plan-1/final_plan_draft4.md`); then, because the whole-record gate
+      read the whole archive over the network drive on every run and would have needed it online for every
+      extension, the per-write gate (rounds `wrf3k-gate-plan-1`, `wrf3k-gate-code-1`; plan
+      `~/.claude/plans/please-read-home-mike-git-envlib-repos-i-eager-island.md`): committed
+      `manifests/<dataset>.json` hash what was verified, new labels are compared sampled per source file plus band
+      edges (blind spot ~m/24 for m bad frames in one file, accepted by Mike), the range is its own check (#11).
+      `dev/plants.py` 97/97; every gate rule mutated and caught (one equivalent mutant).
+    - **Deviations from thalweg's request** (Mike's rulings, 2026-10-02; pointer in `thalweg/OPEN_WORK.md`): SNOW/SMOIS
+      daily, not hourly; no XLAND/LANDMASK; specific humidity, not mixing ratio (negative Q2 clipped to 0); wind
+      direction added.
+    - **Reader notes for thalweg:** SWDOWN is valid ~15 min before its label, GLW is the call 30 min before; SMOIS = 1
+      marks water and glacier cells; depth = layer bottoms; query the static terrain without a time window, and do
+      not use terrain > 0 as a land mask (coastal sea cells reach ~300 m); shortwave reaches 1710.5 W m-2 (above the
+      top-of-atmosphere beam: multiple reflection over snow under cloud, location to confirm).
+    - **Still open:**
+      - **Manifests not on GitHub for `precipitation`, `volumetric_water_content` and `altitude`** (2026-10-06:
+        `origin/main` has the other nine). The precipitation's was written on the server (commit and push it); soil
+        and altitude were published before the per-write gate, so each needs one bootstrap run of
+        `verify_build.py` (archive online), then commit and push. The next extension of each is verified against it.
+      - **Precipitation #5 `source_files`:** the published file carries the original build's file list; ruling
+        (Mike, 2026-10-04): leave it until the next extension, whose build re-stamps it. Its gate record is a FAIL
+        until then, which matters only to `publish.py`.
+      - **The shortwave maximum, 1710.5 W m-2:** confirm it sits on high snowy terrain (the locator script in the
+        2026-10-06 session). If it is at sea or low ground, the 2000 bound needs another look.
+      - **Publication record** in wrf-3k `PROVENANCE.md`: identity, range and publish time for all 12 written from the
+        live catalogue (2026-10-06); still to add from Mike's outputs: sizes, chunks read back, and confirmation that
+        `verify_remote.py` passed for the eight reported only as "added" (precipitation, temperature, soil and
+        terrain were reported end to end).
+      - **The direction-geography bound (0.5 deg)** was calibrated on Jul-Dec 1990 only; the full record passed it,
+        so record its maximum from `logs/verify_build_wind_direction.json` (`7_values.geo_max_deg`).
+      - **The first extension with only the new days of source online** (the per-write gate's purpose), whenever the
+        next year is built.
     - **Backlog from this work:**
       - LANDMASK as a declared ancillary variable of the terrain dataset;
       - earth-relative u/v datasets;
@@ -66,16 +64,12 @@ not yet proven; remove once the close-check passes) + **backlog**; completed ite
   - **Extend back to 1980:** now for every dataset, with the "1980s prepend" ranges in the README table. Update
     `config.ERA5_YEARS`, then `verify_build` → `publish` → `verify_remote`. This re-uploads ~all groups. The
     static terrain is already stamped 1980-01-01.
-  - **Optional `verify_build` speed-ups** (precipitation; full-archive run ≈ 1 h on a network drive):
-    - #6 reads frames by index list rather than a slice;
-    - #6 is single-threaded (parallel reads would help);
-    - #4 and #6 each stream the stored chunks, so they could share one pass.
   - **The published `PREC_ACC` was backfilled offline** (`wrf-runs/projects/wrf_3k/v33_3km_6d/backfill_prec_acc.py`;
     the files' `PREC_ACC_BACKFILL` / `derivation` attributes). PROVENANCE now says so (staged 2026-10-02).
     Remaining close-check: confirm every archive file is backfilled. Only the local files were checked; weeks
     rerun with native `prec_acc_dt` differ by design at one frame per week.
 - [ ] **[ingest/qa] The tethys QC STREAMFLOW snapshot has a 1-hour DST shift in summer and carries raw-system values** (2026-09-14, `graphql/reports/tethys-diff-68801.md`, verified two ways — against GraphQL and against the DST-verified raw twin; details in `graphql/PROVENANCE.md`). Bears on α3: the other five tethys QC datasets were exported the same way and are UNCHECKED. Close-check for each: a season-split lag scan against its raw twin (`diff_tethys.py`'s § 5 generalised) before any of them is published as `quality_controlled`. The `qa/PROVENANCE.md` "lag-0 evidence" was a single all-months scan and cannot see this.
-- [ ] **[ingest/graphql] Build plan for the GraphQL datasets** (hourly `ecan-streamflow-qc` + native 15-min; the latter needs the toolkit `statistic='point'` engine below). **thalweg is a consumer (added 2026-10-02, review `thalweg-step0-plan-1`):** it needs the hourly QC streamflow for 68810, 69302, 69505 and 70105 (from 1990-07-01 only; the 1980s are a sealed holdout), the interval label as a machine-readable attribute (today it is free text in the description), the per-hour quality code, a build that reads the **pinned as-of cache** (so thalweg's cache-route and dataset-route values agree as packed integers), and a dated version per build. Note for the code spec: the resampler's minimum-code-per-hour lets one 200 reading hide a 300 in the same hour. Inputs settled by the extraction: verbatim cache, `resample_station` + `hourly_min_code`, `cache.latest_pages(--as-of)`. Open inputs: the coordinate audit (7 raw-twin sites sit > 200 m from their reprojected NZTM — 68801 by 743 m, 70601 by 167 km); refresh strategy (code `200` spans 68801's whole record, so "refresh the sub-600 years" is the whole record; the merge cannot retract); whether `qa/`'s streamflow leg is superseded (the diff says the snapshot is not the QA record).
+- [ ] **[ingest/graphql] Build plan for the GraphQL datasets** (hourly `ecan-streamflow-qc` + native 15-min; the latter needs the toolkit `statistic='point'` engine below). **thalweg is a consumer (added 2026-10-02, review `thalweg-step0-plan-1`):** it needs the hourly QC streamflow for 68810, 69302, 69505 and 70105 (from 1990-07-01 only; the 1980s are a sealed holdout), the interval label as a machine-readable attribute (today it is free text in the description), the per-hour quality code, a build that reads the **pinned as-of cache** (so thalweg's cache-route and dataset-route values agree as packed integers), and a dated version per build. Note for the code spec: the resampler's minimum-code-per-hour lets one 200 reading hide a 300 in the same hour. Found by review `thalweg-step0-code-2` in `envlib-ingest-ecan-env/graphql`, for the build plan: (a) `concat_pages` drops null/out-of-bounds readings with their codes before the per-hour code, so a code-100 reading can vanish while the hour interpolates across it; (b) `resample_station` keeps the first code of readings that round onto one stamp; (c) `cache.latest_pages` returns an older year page in preference to a newer split (bisected) refresh of the same year. None occurs in the current cache; thalweg's dev reader refuses (a) and (b). Inputs settled by the extraction: verbatim cache, `resample_station` + `hourly_min_code`, `cache.latest_pages(--as-of)`. Open inputs: the coordinate audit (7 raw-twin sites sit > 200 m from their reprojected NZTM — 68801 by 743 m, 70601 by 167 km); refresh strategy (code `200` spans 68801's whole record, so "refresh the sub-600 years" is the whole record; the merge cannot retract); whether `qa/`'s streamflow leg is superseded (the diff says the snapshot is not the QA record).
 
 - [ ] **[toolkit+ingest] The container images IGNORE `uv.lock` — they float to the newest transitive deps on every rebuild, and that took production down** (2026-08-25; HIGH — this is the mechanism, the portalocker incident is just its first casualty). `Dockerfile` installs with `pip install "envlib-ingest-base==<v>"` straight from PyPI, deliberately, so "the package's own pyproject is the single source of truth". The consequence was never written down: **a rebuild resolves whatever the index holds that day**, so an image built today and an image built a fortnight ago can differ in every transitive dependency while carrying the same toolkit version — and the `uv.lock` files that pin the *developer* environments have no effect on it whatsoever. **What it cost:** portalocker 4.2.0 (2026-08-22) made `lock()` reject `LOCK_UN`, which is exactly how booklet <= 0.12.9 releases its OS locks; a routine ECan rebuild three days later resolved it and **all three datasets failed at `Catalogue()` construction** — a full outage, not one dataset. Locally nothing could reproduce it: every venv is pinned to portalocker 3.2.0 by its lock, so the test suites were green throughout. **The gap is structural, not a booklet bug** — booklet 0.12.10 fixes this instance properly (it now uses unlock() and needs no cap), but the next unpinned transitive dep will do the same thing. Options to weigh: build images from the lock (`uv sync --frozen` / `uv export` → the image), or keep the PyPI install but add a post-build smoke test that actually opens a booklet file and a cfdb dataset before the image is tagged. The second is cheap and would have caught this in seconds — the failure was on the very first `open()`. Related: **verify the artifact, not the pipeline** — PyPI presence, green commits and a successful build all held while the image was broken.
 - [ ] **[ingest] A PARTIAL cadence shift to a non-daily product reports nothing — accepted, but decide it again if it ever fires** (surfaced 2026-08-25, round `envlib-stationid-1`; LOW). `source._is_flip_like` counts a cadence trip as evidence only when the spacing is within 2% of a whole multiple of 24 h, because a daily-totals flip is the only coarse product endpoint 78 was ever measured serving (2026-08-07, one day's measurement of a third party). If it starts serving, say, 4-hourly, every site trips, none is flip-shaped, the `>= 2` raise never fires — and since Deploy A the skipped sites are log-only. The *total* case is covered by the new zero-data guard. Raising on `len(unknown) >= 2` regardless of shape was offered by the reviewer and **rejected**: two unrelated gappy gauges in one run would then page, which is the noise Deploy A exists to remove. Neither arm could tell how often that happens — **the run history would settle it**, and if two-gauge trips turn out to be rare the unconditional raise is the better trade.

@@ -456,7 +456,7 @@ def merge_run(ds, stations: dict, run: dict, *, variable: str, overwrite: bool =
     }
 
 
-def build_and_push(member_conn, path, meta, stations: dict, run: dict, *, num_groups=None, **build_kwargs):
+def build_and_push(member_conn, path, meta, stations: dict, run: dict, *, group_bytes=None, **build_kwargs):
     """First run: build the local ``ts_forecast`` and push it to its S3 remote.
 
     There is deliberately **no catalogue here**. A forecast archive of a commercial provider's
@@ -465,17 +465,18 @@ def build_and_push(member_conn, path, meta, stations: dict, run: dict, *, num_gr
     ``envlib.validate_dataset`` in ``build_local``, so the dataset carries CV-validated identity
     fields and is trivially promotable later if that ever changes.
 
-    ``num_groups=None`` (per-key objects) is right for a continuously-appended archive: each run
-    is one small chunk, and every push moves exactly the run that changed.
+    ``group_bytes=None`` (per-key objects) is right for a continuously-appended archive: each run
+    is one small chunk, and every push moves exactly the run that changed (a grouped remote would
+    re-upload its partly filled last group on every run).
     """
     build_local(path, meta, stations, run, **build_kwargs)
-    with open_edataset(member_conn, str(path), flag='w', num_groups=num_groups) as eds:
+    with open_edataset(member_conn, str(path), flag='w', group_bytes=group_bytes) as eds:
         result = eds.push()
     return {'path': str(path), 'push': result}
 
 
 def update_and_push(
-    member_conn, path, stations: dict, run: dict, *, variable: str, overwrite: bool = False, num_groups=None
+    member_conn, path, stations: dict, run: dict, *, variable: str, overwrite: bool = False
 ):
     """Incremental run: pull the remote, merge one run, push.
 
@@ -484,7 +485,7 @@ def update_and_push(
     on every run and wants a periodic ``ds.prune()``, AFTER the push (pruning is local-only and
     preserves key timestamps, so it cannot inflate the next push).
     """
-    with open_edataset(member_conn, str(path), flag='w', num_groups=num_groups) as ds:
+    with open_edataset(member_conn, str(path), flag='w') as ds:   # the existing remote's storage mode
         report = merge_run(ds, stations, run, variable=variable, overwrite=overwrite)
         result = ds.push()
     return {'merge': report, 'push': result}

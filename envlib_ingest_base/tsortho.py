@@ -660,15 +660,15 @@ def merge_dataset(ds, stations: dict, series: dict, *, variable: str):
     }
 
 
-def build_and_publish(cat, path, member_conn, rcg_conn, meta, stations, series, *, num_groups=None, **build_kwargs):
+def build_and_publish(cat, path, member_conn, rcg_conn, meta, stations, series, *, group_bytes=None, **build_kwargs):
     """First publish: build a local ts_ortho cfdb and publish it to the commons (data then RCG entry).
 
-    ``num_groups=None`` (default) stores each chunk as its own S3 object — the right choice
+    ``group_bytes=None`` (default) stores each chunk as its own S3 object — the right choice
     for continuously-updated ts_ortho datasets (small key counts, frequent single-chunk
-    updates: every push/pull moves exactly the changed data). Grouping is a request-batching
-    optimization for LARGE, rarely-updated archives (thousands of keys — see ebooklet's
-    guidance of 10-100MB per group); pass a prime ``num_groups`` only for that shape.
-    The choice is fixed at first publish.
+    updates: every push moves exactly the changed chunks, with no partly filled group to
+    re-upload). Pass an int (bytes per group; ebooklet's default is 32 MiB) for grouped
+    storage, which packs chunks in write order and suits large archives that grow by
+    appending. The mode is fixed at first publish.
 
     ``**build_kwargs`` go straight to ``build_local`` — including ``ancillary=`` to declare
     companion ``(point, time)`` planes (e.g. a per-timestep quality grade), whose data rides in
@@ -676,17 +676,17 @@ def build_and_publish(cat, path, member_conn, rcg_conn, meta, stations, series, 
     the roster is read back from the stored dataset's ``ancillary_variables`` attr.
     """
     build_local(path, meta, stations, series, **build_kwargs)
-    return cat.publish(str(path), member_conn, rcg_conn, num_groups=num_groups)
+    return cat.publish(str(path), member_conn, rcg_conn, group_bytes=group_bytes)
 
 
-def update_and_publish(cat, path, member_conn, rcg_conn, stations, series, *, variable, num_groups=None):
+def update_and_publish(cat, path, member_conn, rcg_conn, stations, series, *, variable):
     """Incremental update: pull the remote, merge the recent window, then publish (diff + entry refresh).
 
     ``path`` is a local working cache linked to ``member_conn``; the merge reads only the coords +
-    the affected time block, so no full-remote materialization is required. ``num_groups`` is
-    read from the remote for existing datasets (the first-publish choice wins) — leave it None.
+    the affected time block, so no full-remote materialization is required. The storage mode is
+    the existing remote's (fixed at first publish), so none is passed here.
     """
-    with open_edataset(member_conn, str(path), flag='w', num_groups=num_groups) as ds:
+    with open_edataset(member_conn, str(path), flag='w') as ds:
         report = merge_dataset(ds, stations, series, variable=variable)
-    result = cat.publish(str(path), member_conn, rcg_conn, num_groups=num_groups)
+    result = cat.publish(str(path), member_conn, rcg_conn)
     return {'merge': report, 'publish': result}
