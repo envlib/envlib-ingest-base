@@ -256,11 +256,15 @@ attrs so merges apply the same filter). `precision` is
 **decimal places** (cfdb picks the int packing width from `precision` + `min_value`/`max_value`);
 pass `standard_name` to override envlib's auto-derived CF name. Returns the path.
 
-**Memory: bounded by ONE STATION ROW, not by the dataset.** Rows are written individually
-(`var[i, :] = row`), matching the ts_ortho `chunk_shape` of `(1, time_chunk)`, so a build's peak
-tracks `n_times` rather than `n_stations × n_times`. Measured on 400 stations × 150,000 steps:
-~11 MB peak, against ~480 MB for a single dense plane — and it is *faster* than the whole-plane
-write, since the large transient allocations are gone. **What this does NOT cover:** `series` is
+**Chunks and write order.** The default `chunk_shape` is `(1, time_chunk)`: one station, and a time
+chunk that is the first highly composite number of steps ≥ 2520 spanning whole days (2520 for hourly
+data = 105 days; 10,080 for 15-minute data). It is not clipped to the build's length, because the
+chunk shape is fixed for the dataset's life. The build writes **block by block** — every station's
+chunk (and its ancillary planes) for one time block, then the next — because grouped remotes pack
+chunks in write order: a block-major file keeps each time block in its own few groups, so the hourly
+update re-uploads only the current block's groups. Peak memory is one block of one station.
+Measured on 400 stations × 150,000 steps with the earlier row-at-a-time writer: ~11 MB peak, against
+~480 MB for a single dense plane. **What this does NOT cover:** `series` is
 still a dict holding every station's arrays, so the *caller* carries ~24 B per stored observation
 for the whole build (~784 MB on a 33 M-observation source). On a large source that dict — not the
 write — is the ceiling.
@@ -394,14 +398,21 @@ update_and_publish(cat, 'flow.cfdb', member, rcg, stations, series_recent,
                    variable='streamflow')
 ```
 
-**Remote storage layout**: by default (`group_bytes=None`) each chunk is its own S3 object —
-the right choice for continuously-updated ts_ortho datasets (tens of keys; every hourly
-push/pull moves exactly the changed chunk and nothing else). Grouped storage (`group_bytes=<int>`,
-ebooklet ≥ 0.11) packs chunks in write order into group objects of up to that many bytes; it suits
-**large archives**, including ones that grow by appending (an append uploads the new chunks plus at
-most one partly filled group). The choice is fixed once the dataset is first pushed. For how chunk size and shape
-trade off on each layout (request costs, per-station vs multi-station chunks), see cfdb's
+**Remote storage layout** (the telemetry layout, decided 2026-10-08): by default
+(`group_bytes='auto'`) `build_and_publish` publishes **grouped**, with `group_bytes_for(path,
+variable)`: the largest power of two at most half a block (all stations × one time chunk), floored at
+64 KiB. One block then spans at least two groups, so a single-station read stays exact, and an
+hourly update uploads a few groups instead of one object per station. Pass an int to choose the size,
+or `None` for per-key storage (one S3 object per chunk; e.g. a frozen dataset). Later pushes inherit
+the mode and the recorded size. The measurements behind this are in ebooklet's
+`planning/write-order-groups-evidence/telemetry-layout/RESULTS.md`; for chunk sizes on remotes in
+general see cfdb's
 [Chunk sizes for remote datasets](https://mullenkamp.github.io/cfdb/guide/s3-remote/#chunk-sizes-for-remote-datasets).
+
+**Re-laying out an existing dataset**: `rechunk_copy(src, dst, time_chunk=...)` copies an open
+ts_ortho dataset into an empty one with new time chunks, block by block, and `compare_datasets(a, b)`
+lists every difference between two (attrs, CRS, coordinates, encodings and values; chunk shapes and
+the time origin aside) as the gate before a republish.
 
 `build_and_publish` takes the same keyword build args as `build_local`
 (`variable`/`units`/`precision`/`min_value`/`max_value`/`standard_name`/…); `update_and_publish` only

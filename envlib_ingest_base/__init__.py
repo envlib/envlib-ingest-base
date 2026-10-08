@@ -9,16 +9,27 @@
 from envlib_ingest_base.resample import resample
 from envlib_ingest_base.tsforecast import build_and_push, merge_run, update_and_push
 from envlib_ingest_base.tsforecast import build_local as build_forecast_local
-from envlib_ingest_base.tsortho import build_and_publish, build_local, merge_dataset, update_and_publish
+from envlib_ingest_base.tsortho import (
+    build_and_publish,
+    build_local,
+    compare_datasets,
+    group_bytes_for,
+    merge_dataset,
+    rechunk_copy,
+    update_and_publish,
+)
 
-__version__ = '0.5.0'
+__version__ = '0.6.0'
 __all__ = [
     'build_and_publish',
     'build_and_push',
     'build_forecast_local',
     'build_local',
+    'compare_datasets',
+    'group_bytes_for',
     'merge_dataset',
     'merge_run',
+    'rechunk_copy',
     'resample',
     'update_and_publish',
     'update_and_push',

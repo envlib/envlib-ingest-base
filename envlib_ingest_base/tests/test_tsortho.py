@@ -1068,7 +1068,7 @@ def test_each_chunk_written_exactly_once(tmp_path):
     log-structured, so the file GROWS until pruned), and can force a synchronous buffer flush. The
     resulting file is still correct — so only a write counter catches a regression here.
     """
-    n_steps = 60_000                                  # spans 3 chunks at the 25k default
+    n_steps = 60_000                                  # spans 24 chunks at the 2520 hourly default
     stns = stations_dict(STNS_AB)
     rng = np.random.default_rng(1)
     series = {r: (BASE + HOUR * np.sort(rng.choice(n_steps, 300, replace=False)),

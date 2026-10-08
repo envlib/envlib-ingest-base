@@ -30,11 +30,14 @@ dependencies = [
   # so it must be able to open whatever another producer on 0.10 published. Existing datasets keep
   # their recorded compression when updated; only newly built ones are shuffled.
   "cfdb>=0.11.0",
-  "ebooklet>=0.11.0",
+  "ebooklet>=0.11.0",  # raised to >=0.11.1 once released (index prune, refusal close)
   "numpy",
   "shapely>=2.0",
   "sentry-sdk",
   "booklet>=0.12.10",
+  # the default ts_ortho time chunk is picked from rechunkit's highly composite list
+  # (tsortho._default_time_chunk), so later rechunks have small common multiples
+  "rechunkit>=0.6.0",
 ]
 
 [dependency-groups]

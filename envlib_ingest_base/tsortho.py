@@ -66,8 +66,13 @@ they are non-NaN (so a station that is briefly offline, or an interval that resa
 never clobbers good stored data). New stations append to the point axis; new steps extend the
 time axis (in the coord's own stored dtype). A re-run over the same window is a no-op.
 
-Both write paths — build and merge — iterate BY STATION, matching the ts_ortho chunk shape of
-`(1, time_chunk)`. Peak memory therefore tracks one station's row, never the point dimension.
+The chunk shape is ``(1, time_chunk)``: one station, and by default a time chunk that is a highly
+composite number of steps spanning whole days (2520 for hourly data; see ``_default_time_chunk``).
+The build writes **block by block** — every station's chunk for one time block, then the next
+block — because ebooklet's write-order groups pack chunks in the order they were written: a
+block-major file keeps each time block in its own few groups, so the hourly update re-uploads the
+current block's groups, not the whole dataset. The merge iterates by station over its window.
+Peak memory tracks one block of one station, never the point dimension.
 Note the store is log-structured, so each merge orphans the chunks it rewrites: a continuously
 merged dataset grows every run and wants a periodic `ds.prune()` (local-only, timestamp-preserving,
 so it cannot inflate a push).
@@ -80,10 +85,14 @@ with the ebooklet edataset + ``envlib.Catalogue`` publish.
 from __future__ import annotations
 
 import logging
+import math
 
+import booklet
 import numpy as np
 from cfdb import dtypes, open_dataset, open_edataset
+from ebooklet import DEFAULT_GROUP_BYTES
 from envlib.vocabularies import frequency_entry
+from rechunkit.main import composite_numbers
 
 from envlib_ingest_base.stations import (
     STATION_ALTITUDE_VAR,
@@ -102,7 +111,13 @@ from envlib_ingest_base.stations import (
 logger = logging.getLogger(__name__)
 
 
-_DEFAULT_TIME_CHUNK = 25_000  # steps; see the chunk_shape default rationale in build_local
+# the default time chunk is the first highly composite number of steps at or above this that spans
+# whole days (2520 hourly = 105 days); see _default_time_chunk and the layout decision of 2026-10-08
+_MIN_TIME_CHUNK = 2520
+_DAY_US = 86_400_000_000
+# group_bytes for a grouped remote: a power of two at most half a block (all stations x one time
+# chunk), so one block spans at least two groups and a single-station read stays exact
+_MIN_GROUP_BYTES = 64 * 1024
 # a series entry is (times, values) or (times, values, extras) — the 3rd slot carries ancillary data
 _SERIES_WITH_EXTRAS = 3
 # natural-unit ladder: the largest unit that divides the step becomes the stored coord unit
@@ -131,6 +146,57 @@ def _freq_step(code) -> tuple[int, str]:
         if step_us % unit_us == 0:
             return step_us, unit
     return step_us, 'us'  # unreachable with the current CV (whole-second codes only)
+
+
+def _default_time_chunk(step_us: int) -> int:
+    """The default ts_ortho time chunk for a fixed step: the first highly composite number (from
+    rechunkit's list, so later rechunks stay cheap) that is at least ``_MIN_TIME_CHUNK`` steps and
+    spans a whole number of days. Hourly -> 2520 (105 days), 15-minute -> 10,080 (105 days).
+
+    The size trades the hourly push (the current chunks plus their groups) against the remote
+    index every reader re-downloads after each change (one entry per chunk) and against
+    compression (~2 % worse than 25,000 steps). Measurements: ebooklet
+    ``planning/write-order-groups-evidence/telemetry-layout/RESULTS.md``.
+    """
+    for n in composite_numbers:
+        if n >= _MIN_TIME_CHUNK and (n * step_us) % _DAY_US == 0:
+            return int(n)
+    msg = f'no highly composite time chunk spans whole days at a step of {step_us} us'
+    raise ValueError(msg)
+
+
+def _pow2_group_bytes(block_bytes: float) -> int:
+    """The largest power of two at most half of ``block_bytes``, floored at 64 KiB and capped at
+    ebooklet's default group size (above it, full-band reads get slower)."""
+    half = block_bytes / 2
+    if half < _MIN_GROUP_BYTES:
+        return _MIN_GROUP_BYTES
+    return int(min(2 ** math.floor(math.log2(half)), DEFAULT_GROUP_BYTES))
+
+
+def group_bytes_for(path, variable: str) -> int:
+    """The ``group_bytes`` for publishing the local ts_ortho cfdb at ``path`` grouped.
+
+    One block — all stations x one time chunk of ``variable`` — must span at least two groups, or
+    a group holds several blocks of every station and a single-station read over-reads by about a
+    group. The block size is measured from the stored (compressed) chunk bytes of ``variable``,
+    scaled from the file's time length to one chunk. A short or sparse first build measures
+    small, which errs toward smaller groups (the safe direction), and a remote can be re-packed to
+    another value later by passing it on a push.
+    """
+    return _pow2_group_bytes(_block_bytes(path, variable))
+
+
+def _block_bytes(path, variable: str) -> float:
+    """Stored bytes of one block of ``variable``: its live chunk bytes scaled from the file's time
+    length to one time chunk."""
+    with open_dataset(str(path)) as ds:
+        n_times = ds[variable].shape[1]
+        time_chunk = ds[variable].chunk_shape[1]
+    prefix = f'{variable}!'
+    with booklet.open(str(path), 'r') as blt:
+        stored = sum(vlen for key, _ts, _off, vlen in blt.locations() if key.startswith(prefix))
+    return stored * time_chunk / n_times
 
 
 def _floor_step(us: int, step_us: int) -> int:
@@ -253,18 +319,22 @@ def _check_extras(non_empty: dict, roster) -> None:
             raise ValueError(msg)
 
 
-def _write_rows(var, stations: dict, series: dict, t0_us: int, n_times: int, step_us: int, dt, plane=None) -> None:
-    """Write the dense ``(n_point, n_time)`` plane ONE STATION ROW AT A TIME.
+def _write_blocks(planes, stations: dict, series: dict, t0_us: int, n_times: int, step_us: int, block: int) -> None:
+    """Write the dense ``(n_point, n_time)`` planes BLOCK BY BLOCK: for each time block of
+    ``block`` steps (the time chunk), every station's chunk of every plane, then the next block.
 
-    This replaces an earlier ``_assemble`` that built the whole dense plane in memory and
-    returned it for a single ``var[:] = ...`` assignment. **That defeated the main reason to use
-    cfdb.** cfdb reads and writes in chunks, and the ts_ortho chunk shape is ``(1, time_chunk)``
-    — *one station row* — so the whole-plane approach allocated a station-count multiple of what
-    a write actually needs. Measured on a 606-station by 620,771-step dataset: 3.01 GB per plane,
-    two planes, and roughly double again for ``_nan_safe``'s mask and copy. Per row it is ~5 MB.
+    ``planes`` is a list of ``(var, dt, plane)``: ``plane=None`` writes the primary values, a
+    string writes that named ancillary (stations lacking it stay NaN). Within a block each station's
+    planes are written together, so a value and its ancillary grade sit next to each other.
 
-    ``plane=None`` writes the primary values; a string writes that named ancillary (stations
-    lacking it stay NaN), so both share one code path and land on identical geometry.
+    **Why block-major.** ebooklet's write-order groups pack chunks in the order they were written
+    to the local file. Written station by station, each group holds whole station histories, so the
+    hourly update (which rewrites every station's current chunk) touches nearly every group and
+    re-uploads about the whole dataset until the next rollover. Written block by block, each group
+    holds one time block, and an update touches only the current block's groups.
+
+    It replaced a whole-plane ``_assemble`` (3.01 GB per plane on a 606-station x 620,771-step
+    dataset) and then a row-at-a-time writer. Peak memory is one block of one station.
 
     ⚠️ **Iterate ``stations``, never ``series``.** The point coordinate and the
     ``station_id``/``station_ref``/``station_name`` arrays are built in ``stations`` order, so row
@@ -272,26 +342,45 @@ def _write_rows(var, stations: dict, series: dict, t0_us: int, n_times: int, ste
     would map the *i*-th station-that-has-data to point *i* and silently mislabel every station
     after the first data-less one — a file that validates cleanly and is wrong.
 
-    A station with no data still gets an explicitly written all-NaN row, exactly as before: an
-    unwritten chunk also reads as NaN, but it would change which chunks exist and the file size.
+    A station with no data still gets explicitly written all-NaN chunks: an unwritten chunk also
+    reads as NaN, but it would change which chunks exist and the file size.
 
-    Each row is written in ONE call, and each chunk therefore exactly once. Revisiting a chunk
-    costs a full decompress+recompress, orphans the previous block (the store is log-structured,
-    so the file grows until pruned), and can force a synchronous buffer flush.
+    With a point chunk of 1 (the ts_ortho default) each chunk is written exactly once (blocks are
+    chunk-aligned on a fresh axis); a caller's larger point chunk is revisited once per station, as
+    the row writer before it did. Revisiting a chunk costs a full decompress+recompress, orphans the
+    previous block (the store is log-structured, so the file grows until pruned), and can force a
+    synchronous buffer flush.
     """
-    for i, ref in enumerate(stations):
-        # a fresh row per station: nothing is ever aliased into cfdb's chunk buffer, and the
-        # peak is one row regardless of station count
-        row = np.full(n_times, np.nan, dtype='float64')
+    # per station, its integer timestamps in ascending order (the series contract; sorted once if
+    # a producer broke it), so each block's slice is two binary searches, not a scan
+    ordered = {}
+    for ref in stations:
         s = series.get(ref)
-        if s is not None:
-            t, v, ex = s
-            arr = v if plane is None else ex.get(plane)
-            if arr is not None:
-                col = _step_index(t, t0_us, step_us)
-                ok = (col >= 0) & (col < n_times)
-                row[col[ok]] = arr[ok]
-        var[i, :] = _nan_safe(row, dt)
+        if s is None:
+            continue
+        t, v, ex = s
+        ti = t.view('int64')
+        if ti.size > 1 and not bool((ti[1:] >= ti[:-1]).all()):
+            order = np.argsort(ti, kind='stable')
+            ti, v, ex = ti[order], v[order], {k: a[order] for k, a in ex.items()}
+        ordered[ref] = (ti, v, ex)
+
+    for b0 in range(0, n_times, block):
+        b1 = min(b0 + block, n_times)
+        lo_us, hi_us = t0_us + b0 * step_us, t0_us + b1 * step_us
+        for i, ref in enumerate(stations):
+            s = ordered.get(ref)
+            if s is not None:
+                ti, v, ex = s
+                lo, hi = (int(x) for x in np.searchsorted(ti, [lo_us, hi_us], side='left'))
+            for var, dt, plane in planes:
+                # a fresh segment per write: nothing is ever aliased into cfdb's chunk buffer
+                seg = np.full(b1 - b0, np.nan, dtype='float64')
+                if s is not None and hi > lo:
+                    arr = v if plane is None else ex.get(plane)
+                    if arr is not None:
+                        seg[(ti[lo:hi] - lo_us) // step_us] = arr[lo:hi]
+                var[i, b0:b1] = _nan_safe(seg, dt)
 
 
 def build_local(
@@ -362,19 +451,20 @@ def build_local(
     tmin = _floor_step(min(int(t.astype('int64').min()) for t, *_ in non_empty.values()), step_us)
     tmax = _floor_step(max(int(t.astype('int64').max()) for t, *_ in non_empty.values()), step_us)
     times_us = np.arange(tmin, tmax + 1, step_us)
-    # NOTE: the dense plane is NOT assembled here. Rows are written individually inside the
-    # dataset context below (see _write_rows) so peak memory is one row, not one plane.
+    # NOTE: the dense plane is NOT assembled here. Blocks are written individually inside the
+    # dataset context below (see _write_blocks) so peak memory is one block, not one plane.
     points, ids, names, refs = _points_ids_names(stations)
 
     if chunk_shape is None:
         # ts_ortho default: point dim = 1 (ruling 2026-07-20). The dominant consumer read is
         # ONE station's history — an all-stations point chunk forces downloading the whole
         # dataset to read one station (~250x amplification); one-station chunk columns also
-        # keep new-station appends and per-station updates independent. The time chunk trades
-        # object count vs per-chunk compression vs the perpetual per-update upload (each run
-        # rewrites every station's TAIL chunk): ~25k steps ≈ a handful of objects per station
-        # at ~50-200 KB each, a few MB of upload per update run.
-        chunk_shape = (1, int(min(times_us.size, _DEFAULT_TIME_CHUNK)))
+        # keep new-station appends and per-station updates independent. The time chunk is the
+        # telemetry layout of 2026-10-08 (see _default_time_chunk). It is NOT clipped to this
+        # build's length: the chunk shape is fixed for the dataset's life, so a short first
+        # build (e.g. a one-month backfill) must not fix a short chunk forever; cfdb stores the
+        # partly filled chunk and the axis grows into it.
+        chunk_shape = (1, _default_time_chunk(step_us))
 
     unit_us = dict(_UNIT_US).get(unit, 1)
     tvals = times_us.astype('datetime64[us]').astype(f'datetime64[{unit}]')
@@ -397,7 +487,7 @@ def build_local(
         # merge_dataset reads back, so the stored dataset stays the source of truth on update.
         if ancillary:
             dv.attrs['ancillary_variables'] = ' '.join(ancillary)
-        _write_rows(dv, stations, non_empty, tmin, times_us.size, step_us, dt)
+        planes = [(dv, dt, None)]
 
         for aname, spec in ancillary.items():
             adt = dtypes.dtype(
@@ -413,10 +503,10 @@ def build_local(
             # written LAST so a caller-supplied attrs dict can never weaken the QC bounds
             av.attrs['valid_min'] = float(spec['min_value'])
             av.attrs['valid_max'] = float(spec['max_value'])
-            # Previously this nested a whole-plane _assemble INSIDE _nan_safe while the primary
-            # plane was still resident — three full planes plus a mask live at once, the worst
-            # single moment in the build. Now one row at a time, like the primary.
-            _write_rows(av, stations, non_empty, tmin, times_us.size, step_us, adt, plane=aname)
+            planes.append((av, adt, aname))
+
+        # every plane in one block-major pass, so a value and its ancillary grade land together
+        _write_blocks(planes, stations, non_empty, tmin, times_us.size, step_us, chunk_shape[1])
 
         sid = ds.create.data_var.generic(STATION_ID_VAR, ('point',), dtype=dtypes.dtype('str'))
         sid[:] = ids
@@ -660,15 +750,166 @@ def merge_dataset(ds, stations: dict, series: dict, *, variable: str):
     }
 
 
-def build_and_publish(cat, path, member_conn, rcg_conn, meta, stations, series, *, group_bytes=None, **build_kwargs):
+def rechunk_copy(src, dst, *, time_chunk: int) -> None:
+    """Copy the ts_ortho dataset ``src`` into the EMPTY ts_ortho dataset ``dst`` with
+    ``(1, time_chunk)`` data chunks, written block by block (see ``_write_blocks`` for why).
+
+    ``src`` is any open ts_ortho dataset (a local file, or an EDataset whose chunks it pulls).
+    ``dst`` is open for write and empty; the caller decides its header (for example passing an
+    existing remote's ``init_bytes`` through ``open_dataset`` to keep that remote's uuid).
+
+    Copied: the dataset attrs, the CRS, the point and time coordinates (the time axis from its
+    decoded values, so a source origin left by a truncation does not carry over) with their attrs,
+    every ``(point, time)`` variable with the source's dtype/encoding and attrs, and every
+    ``(point,)`` station variable with its values and attrs. Anything else (another coordinate, a
+    variable on other dims) raises rather than being dropped silently. Memory is one block of every
+    ``(point, time)`` variable across all stations, plus what cfdb holds to serve a slice (up to one
+    source chunk per station; measured 19.7 MB peak for a 6 MB block). Compression is not copied:
+    ``dst`` keeps whatever it was opened with, so pass ``compression=`` there to choose it.
+    """
+    for name, ds in (('src', src), ('dst', dst)):
+        if ds.dataset_type != 'ts_ortho':
+            msg = f'rechunk_copy: {name} is a {ds.dataset_type!r} dataset, not ts_ortho'
+            raise ValueError(msg)
+    if dst.coord_names or dst.data_var_names:
+        msg = f'rechunk_copy: dst must be empty, but holds {dst.coord_names + dst.data_var_names}'
+        raise ValueError(msg)
+    extra = set(src.coord_names) - {'point', 'time'}
+    if extra:
+        msg = f'rechunk_copy: coordinates {sorted(extra)} are not supported'
+        raise NotImplementedError(msg)
+    planes, statics = [], []
+    for name in src.data_var_names:
+        dims = tuple(src[name].coord_names)
+        if dims == ('point', 'time'):
+            planes.append(name)
+        elif dims == ('point',):
+            statics.append(name)
+        else:
+            msg = f'rechunk_copy: variable {name!r} on dims {dims} is not supported'
+            raise NotImplementedError(msg)
+
+    dst.create.coord.point()
+    dst['point'].append(src['point'].data)
+    dst.create.coord.time(data=src['time'].data, step=src['time'].step)
+    for name in ('point', 'time'):
+        dst[name].attrs.update(dict(src[name].attrs))
+    if src.crs is not None:
+        dst.create.crs.from_user_input(src.crs, xy_coord='point')
+
+    out = {}
+    for name in planes:
+        out[name] = dst.create.data_var.generic(
+            name, ('point', 'time'), dtype=src[name].dtype, chunk_shape=(1, int(time_chunk))
+        )
+        out[name].attrs.update(dict(src[name].attrs))
+    if planes:
+        n_points, n_times = src[planes[0]].shape
+        for b0 in range(0, n_times, time_chunk):
+            b1 = min(b0 + time_chunk, n_times)
+            block = {name: np.asarray(src[name][:, b0:b1].data, dtype='float64') for name in planes}
+            for i in range(n_points):
+                for name in planes:
+                    out[name][i, b0:b1] = _nan_safe(block[name][i].copy(), out[name].dtype)
+
+    for name in statics:
+        sv = dst.create.data_var.generic(name, ('point',), dtype=src[name].dtype)
+        sv[:] = src[name].data
+        sv.attrs.update(dict(src[name].attrs))
+    dst.attrs.update(dict(src.attrs))
+
+
+_DTYPE_FIELDS = ('name', 'dtype_encoded', 'dtype_decoded', 'precision', 'fillvalue', 'offset')
+
+
+def _dtype_fields(dt) -> dict:
+    return {f: str(getattr(dt, f, None)) for f in _DTYPE_FIELDS}
+
+
+def _values_differ(x, y) -> bool:
+    x, y = np.asarray(x), np.asarray(y)
+    if x.shape != y.shape:
+        return True
+    if x.dtype.kind in 'fc' or y.dtype.kind in 'fc':
+        return not np.array_equal(x.astype('float64'), y.astype('float64'), equal_nan=True)
+    return list(x.ravel().tolist()) != list(y.ravel().tolist())
+
+
+def compare_datasets(a, b, *, block: int = _MIN_TIME_CHUNK) -> list:
+    """Every difference between two ts_ortho datasets, ignoring only chunk shapes and the time
+    coordinate's origin. An empty list means equal. Built as the gate before an irreversible
+    republish, so it checks everything a rechunk must preserve:
+
+    - the dataset type, its attrs and the CRS;
+    - the coordinates: decoded values (points by their WKB), every dtype field, step and attrs;
+    - every variable: dims, shape, attrs, and every dtype/encoding field (``_DTYPE_FIELDS``);
+    - the values: ``(point, time)`` variables block by block (``block`` steps across all stations,
+      NaN-aware), station variables whole.
+
+    Read through an EDataset, a chunk the local file lacks is pulled, not read as fill; read
+    through a plain local file, a chunk that was never materialised reads as fill — so compare
+    against a remote read when the question is "did the copy keep everything".
+    """
+    diffs = []
+    if a.dataset_type != b.dataset_type:
+        diffs.append(f'dataset_type: {a.dataset_type!r} != {b.dataset_type!r}')
+    # dict() first: cfdb's Attributes.__iter__ returns dict_keys, not an iterator, so set()/iter() on it raise
+    da, db = dict(a.attrs), dict(b.attrs)
+    if da != db:
+        diffs.append(f'dataset attrs differ: {sorted(k for k in da.keys() | db.keys() if da.get(k) != db.get(k))}')
+    if (a.crs is None) != (b.crs is None) or (a.crs is not None and a.crs != b.crs):
+        diffs.append(f'crs: {a.crs!r} != {b.crs!r}')
+
+    if set(a.coord_names) != set(b.coord_names):
+        diffs.append(f'coordinates: {sorted(a.coord_names)} != {sorted(b.coord_names)}')
+    for name in sorted(set(a.coord_names) & set(b.coord_names)):
+        ca, cb = a[name], b[name]
+        fa, fb = _dtype_fields(ca.dtype), _dtype_fields(cb.dtype)
+        if fa != fb or ca.step != cb.step:
+            diffs.append(f'coord {name}: dtype/step {fa}/{ca.step} != {fb}/{cb.step}')
+        if dict(ca.attrs) != dict(cb.attrs):
+            diffs.append(f'coord {name}: attrs differ')
+        va, vb = np.asarray(ca.data), np.asarray(cb.data)
+        if name == 'point':
+            same = va.shape == vb.shape and [g.wkb for g in va] == [g.wkb for g in vb]
+        else:
+            same = not _values_differ(va, vb)
+        if not same:
+            diffs.append(f'coord {name}: values differ')
+
+    if set(a.data_var_names) != set(b.data_var_names):
+        diffs.append(f'variables: {sorted(a.data_var_names)} != {sorted(b.data_var_names)}')
+    for name in sorted(set(a.data_var_names) & set(b.data_var_names)):
+        va, vb = a[name], b[name]
+        if tuple(va.coord_names) != tuple(vb.coord_names) or va.shape != vb.shape:
+            diffs.append(f'{name}: dims/shape {va.coord_names}{va.shape} != {vb.coord_names}{vb.shape}')
+            continue
+        aa, ab = dict(va.attrs), dict(vb.attrs)
+        if aa != ab:
+            diffs.append(f'{name}: attrs differ: {sorted(k for k in aa.keys() | ab.keys() if aa.get(k) != ab.get(k))}')
+        if _dtype_fields(va.dtype) != _dtype_fields(vb.dtype):
+            diffs.append(f'{name}: dtype/encoding {_dtype_fields(va.dtype)} != {_dtype_fields(vb.dtype)}')
+        if tuple(va.coord_names) == ('point', 'time'):
+            n_times = va.shape[1]
+            for b0 in range(0, n_times, block):
+                b1 = min(b0 + block, n_times)
+                if _values_differ(va[:, b0:b1].data, vb[:, b0:b1].data):
+                    diffs.append(f'{name}: values differ in steps [{b0}, {b1})')
+                    break
+        elif _values_differ(va.data, vb.data):
+            diffs.append(f'{name}: values differ')
+    return diffs
+
+
+def build_and_publish(cat, path, member_conn, rcg_conn, meta, stations, series, *, group_bytes='auto', **build_kwargs):
     """First publish: build a local ts_ortho cfdb and publish it to the commons (data then RCG entry).
 
-    ``group_bytes=None`` (default) stores each chunk as its own S3 object — the right choice
-    for continuously-updated ts_ortho datasets (small key counts, frequent single-chunk
-    updates: every push moves exactly the changed chunks, with no partly filled group to
-    re-upload). Pass an int (bytes per group; ebooklet's default is 32 MiB) for grouped
-    storage, which packs chunks in write order and suits large archives that grow by
-    appending. The mode is fixed at first publish.
+    ``group_bytes='auto'`` (default) publishes grouped with ``group_bytes_for(path, variable)``:
+    the telemetry layout of 2026-10-08, where the block-major build keeps each time block in its
+    own few groups, so the hourly update uploads the current block's groups rather than one object
+    per station. Pass an int to choose the group size, or ``None`` for per-key storage (one S3
+    object per chunk; e.g. a frozen dataset that is never updated). Later pushes inherit the mode
+    and the recorded group size.
 
     ``**build_kwargs`` go straight to ``build_local`` — including ``ancillary=`` to declare
     companion ``(point, time)`` planes (e.g. a per-timestep quality grade), whose data rides in
@@ -676,6 +917,9 @@ def build_and_publish(cat, path, member_conn, rcg_conn, meta, stations, series, 
     the roster is read back from the stored dataset's ``ancillary_variables`` attr.
     """
     build_local(path, meta, stations, series, **build_kwargs)
+    if group_bytes == 'auto':
+        group_bytes = group_bytes_for(path, build_kwargs['variable'])
+        logger.info('publish %s: grouped, group_bytes=%d', build_kwargs['variable'], group_bytes)
     return cat.publish(str(path), member_conn, rcg_conn, group_bytes=group_bytes)
 
 
