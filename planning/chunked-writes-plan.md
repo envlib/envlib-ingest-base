@@ -18,7 +18,7 @@
 > - The real ECan streamflow build went **4.5 GB → 899 MB**, byte-identical (12,023 keys, 0
 >   differing bytes).
 > - `merge_dataset` became per-station too (**552.5 MB → 6.0 MB** with one backdated station), which
->   is beyond what §3 scoped — see the toolkit's `OPEN_WORK.md` Done entry.
+>   is beyond what §3 scoped — see the toolkit's `OPEN_WORK_DONE.md` entry.
 > - Phase 0's heal-path horizon guard landed in `envlib-ingest-ecan-env/raw/ingest.py`, not here.
 >
 > **Phase 2 (the streaming `series` contract) was NOT implemented** and remains open in
