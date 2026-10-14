@@ -1,6 +1,6 @@
 """Source-agnostic resampling of irregular / gappy station telemetry to a fixed cadence.
 
-Two aggregation kinds, matching the two physical measurement types:
+Three statistics, matching the physical measurement types:
 
 - ``'mean'`` (instantaneous signals: river stage, flow) -> an **exact trapezoidal
   time-weighted mean**. The signal is treated as piecewise-linear between consecutive
@@ -16,6 +16,11 @@ Two aggregation kinds, matching the two physical measurement types:
   the accumulation over its own reporting slot) — NOT since-last-report accumulations from
   a totalizing gauge; such feeds must be differenced upstream. Resampling accumulations to
   a cadence FINER than the native reporting interval is not meaningful.
+
+- ``'point'`` (instantaneous samples published as-is) -> an **identity pass-through**: a
+  reading exactly on the ``freq`` grid is kept with its value untouched, an off-grid reading
+  is absent, and two readings on one stamp raise. No interval is estimated, so the
+  missing-data rules below do not apply to it.
 
 Missing data is handled by a two-rule pipeline — the two rules are anchored to two
 different clocks and are NOT derivable from each other:
@@ -139,9 +144,10 @@ def _empty() -> tuple[np.ndarray, np.ndarray]:
     return np.empty(0, dtype='datetime64[us]'), np.empty(0, dtype='float64')
 
 
-def _prep(times, values, round_to=None) -> tuple[np.ndarray, np.ndarray]:
+def _prep(times, values, round_to=None, *, collapse=True) -> tuple[np.ndarray, np.ndarray]:
     """Drop NaT/NaN/±inf, round to the declared precision, sort, and collapse duplicate timestamps
-    (by mean — rounding runs first, so jittery duplicates collide and merge). Returns int64-us t, float v."""
+    (by mean — rounding runs first, so jittery duplicates collide and merge). Returns int64-us t, float v.
+    ``collapse=False`` leaves duplicates in place (sorted, stable) for the caller to judge."""
     dt = _to_dt64us(times)
     v = np.asarray(values, dtype='float64')
     ok = ~np.isnat(dt) & np.isfinite(v)
@@ -154,7 +160,7 @@ def _prep(times, values, round_to=None) -> tuple[np.ndarray, np.ndarray]:
         t = ((t + r // 2) // r) * r  # round half up; floor-division-correct pre-1970 too
     order = np.argsort(t, kind='stable')
     t, v = t[order], v[order]
-    if t.size > 1 and np.any(np.diff(t) == 0):
+    if collapse and t.size > 1 and np.any(np.diff(t) == 0):
         ut, inv = np.unique(t, return_inverse=True)
         v = np.bincount(inv, weights=v) / np.bincount(inv)
         t = ut
@@ -304,7 +310,44 @@ def _resample_sum(
     return ul[keep].astype('datetime64[us]'), sums[keep]
 
 
-_STATISTICS = {'mean': _resample_mean, 'sum': _resample_sum}
+def _resample_point(
+    times,
+    values,
+    *,
+    freq='1h',
+    max_gap=None,  # noqa: ARG001 - accepted for API symmetry; a point has no gaps to bridge
+    gap_multiplier=3.0,  # noqa: ARG001 - as above
+    min_coverage=0.75,  # noqa: ARG001 - as above; no interval is estimated
+    round_to=None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Identity pass-through of instantaneous samples at their native cadence.
+
+    No estimation of any kind: after rounding to ``round_to``, a reading is kept only if it
+    lies exactly on the epoch-anchored ``freq`` grid, with its value untouched; off-grid
+    readings are absent (a point dataset never interpolates to an instant it did not
+    observe). Two readings on one stamp raise rather than merge — averaging them would
+    publish a value nobody measured, so the producer must dedupe upstream. A producer that
+    wants jittered stamps snapped onto the grid declares ``round_to=freq``. ``max_gap``,
+    ``gap_multiplier`` and ``min_coverage`` are accepted for API symmetry and unused (there
+    are no intervals to cover).
+    """
+    freq_us = _freq_us(freq)
+    t, v = _prep(times, values, round_to, collapse=False)
+    if t.size == 0:
+        return _empty()
+    dup = np.flatnonzero(np.diff(t) == 0)
+    if dup.size:
+        first = t[dup[0]].astype('datetime64[us]')
+        msg = (
+            f"statistic='point': {dup.size} duplicate timestamp(s) after round_to (first at {first}); "
+            'a point dataset never merges readings — dedupe upstream'
+        )
+        raise ValueError(msg)
+    on_grid = (t % freq_us) == 0  # np.remainder takes the divisor's sign, so pre-1970 stamps work too
+    return t[on_grid].astype('datetime64[us]'), v[on_grid]
+
+
+_STATISTICS = {'mean': _resample_mean, 'sum': _resample_sum, 'point': _resample_point}
 
 
 def resample(
@@ -319,11 +362,14 @@ def resample(
     - ``'mean'`` — instantaneous signals (river stage, flow): the exact trapezoidal
       time-weighted mean of the piecewise-linear signal.
     - ``'sum'`` — accumulations (rainfall): the right-closed per-slot-total sum.
+    - ``'point'`` — instantaneous samples published at their native cadence: on-grid
+      readings pass through untouched, off-grid readings are absent, duplicates raise.
 
     Future statistics of the instantaneous signal (median/min/max share its whole segment
     machinery, differing only in the final reduction) will slot in here without an API
-    change. The two-rule missing-data pipeline (module docstring) applies to every
-    statistic. Returns the standard ``(times, values)`` tuple.
+    change. The two-rule missing-data pipeline (module docstring) applies to ``'mean'``
+    and ``'sum'``; ``'point'`` estimates nothing, so it has none. Returns the standard
+    ``(times, values)`` tuple.
     """
     try:
         fn = _STATISTICS[statistic]

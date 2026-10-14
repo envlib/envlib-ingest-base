@@ -343,3 +343,56 @@ def test_statistic_dispatch():
         resample(dts('2020-01-01 00:30'), [1.0], statistic='median')
     with pytest.raises(ValueError, match='unsupported statistic'):
         resample(dts('2020-01-01 00:30'), [1.0], statistic=None)
+
+
+# --- statistic='point': identity pass-through ---
+
+
+def _rp(*args, **kwargs):
+    return resample(*args, statistic='point', **kwargs)
+
+
+def test_point_keeps_on_grid_values_untouched():
+    # values a mean engine would change (a spike between two lows) must come back bit-identical
+    times = dts('2020-01-01 00:00', '2020-01-01 00:15', '2020-01-01 00:30', '2020-01-01 00:45')
+    values = np.array([1.0, 1000.0, 1.0, 0.1234])
+    t, v = _rp(times, values, freq='15min')
+    assert np.array_equal(t, times)
+    assert np.array_equal(v, values)  # exact, not allclose
+
+
+def test_point_drops_off_grid_readings():
+    times = dts('2020-01-01 00:00', '2020-01-01 00:07', '2020-01-01 00:15')
+    check(_rp(times, [1.0, 2.0, 3.0], freq='15min'), ('2020-01-01 00:00', '2020-01-01 00:15'), [1.0, 3.0])
+
+
+def test_point_never_fills_absent_stamps():
+    # a missing 00:15 stays missing: nothing is interpolated into the hole
+    times = dts('2020-01-01 00:00', '2020-01-01 00:30')
+    check(_rp(times, [1.0, 3.0], freq='15min'), ('2020-01-01 00:00', '2020-01-01 00:30'), [1.0, 3.0])
+
+
+def test_point_duplicate_stamp_raises():
+    with pytest.raises(ValueError, match='duplicate timestamp'):
+        _rp(dts('2020-01-01 00:15', '2020-01-01 00:15'), [1.0, 2.0], freq='15min')
+
+
+def test_point_duplicate_after_rounding_raises():
+    # two jittery renderings of one stamp collide under round_to and must not be averaged
+    with pytest.raises(ValueError, match='duplicate timestamp'):
+        _rp(dts('2020-01-01 00:14:59', '2020-01-01 00:15:01'), [1.0, 2.0], freq='15min', round_to='1min')
+
+
+def test_point_round_to_freq_snaps_jitter():
+    t, v = _rp(dts('2020-01-01 00:14:59', '2020-01-01 00:30:01'), [1.0, 2.0], freq='15min', round_to='15min')
+    check((t, v), ('2020-01-01 00:15', '2020-01-01 00:30'), [1.0, 2.0])
+
+
+def test_point_pre_1970_on_grid():
+    check(_rp(dts('1957-12-17 04:30', '1957-12-17 04:37'), [5.0, 6.0], freq='15min'), ('1957-12-17 04:30',), [5.0])
+
+
+def test_point_drops_nan_and_handles_empty():
+    check(_rp(dts('2020-01-01 00:00', '2020-01-01 00:15'), [np.nan, 2.0], freq='15min'), ('2020-01-01 00:15',), [2.0])
+    t, v = _rp(dts(), [], freq='15min')
+    assert t.size == 0 and v.size == 0

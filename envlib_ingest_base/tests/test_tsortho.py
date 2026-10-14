@@ -662,6 +662,7 @@ def test_merge_heals_on_empty_window(tmp_path):
         'qc_rejected': 0,
         'anc_qc_rejected': 0,
         'dropped_before_axis': 0,
+        'new_rows_for_existing_refs': 0,
     }
     with open_dataset(str(p)) as ds:
         assert ds['station_id'].attrs['cf_role'] == 'timeseries_id'

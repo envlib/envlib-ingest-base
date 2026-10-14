@@ -150,6 +150,29 @@ t, v = resample(times, [0.0, 0.5, 1.0], statistic='sum')
 #                         # hours 02:00–05:00 ABSENT (no reading) — never fabricated as 0
 ```
 
+#### `statistic='point'` — instantaneous samples published as-is
+
+Identity **pass-through** for a dataset that publishes readings at their native cadence (a 15-min
+flow record published as 15-min points). After rounding to `round_to`, a reading exactly on the
+epoch-anchored `freq` grid is kept with its value untouched. An off-grid reading is absent, and an
+absent stamp stays absent: nothing is interpolated. Two readings on one stamp **raise** instead of
+merging, since averaging them would publish a value nobody measured. A producer that wants jittered
+stamps snapped onto the grid passes `round_to=freq`. `max_gap`, `gap_multiplier` and
+`min_coverage` are accepted and unused, because no interval is estimated.
+
+```python
+times = ['2024-06-01 00:00', '2024-06-01 00:07', '2024-06-01 00:15', '2024-06-01 00:45']
+t, v = resample(times, [1.0, 2.0, 1000.0, 3.0], statistic='point', freq='15min')
+# t -> ['2024-06-01T00:00', '2024-06-01T00:15', '2024-06-01T00:45']
+# v -> [1.0, 1000.0, 3.0]   # values untouched; 00:07 is off-grid and absent; 00:30 stays absent
+```
+
+Not to be confused with `statistic='mean'` at the source's own cadence: that one returns interval
+means (averages of neighbouring readings), as its declaration says.
+
+`resample` returns `(times, values)` only. A producer carrying an ancillary per reading (such as a
+quality code) re-joins it to the returned stamps by exact match.
+
 Config-driven pipelines key both `statistic` and `freq` straight off the dataset's metadata:
 
 ```python
@@ -245,7 +268,7 @@ meta = envlib.Metadata(
 )
 ```
 
-### `build_local(path, meta, stations, series, *, variable, units, precision, min_value, max_value, chunk_shape=None, standard_name=None, extra_var_attrs=None, ancillary=None)`
+### `build_local(path, meta, stations, series, *, variable, units, precision, min_value, max_value, chunk_shape=None, standard_name=None, extra_var_attrs=None, ancillary=None, time_range=None, decoded_dtype='float32')`
 
 Create a fresh local ts_ortho cfdb at the cadence of `meta.frequency_interval`. **Requires
 cfdb >= 0.9.4** (older versions fabricate values when the packed encoder meets NaN or
@@ -264,10 +287,51 @@ chunk (and its ancillary planes) for one time block, then the next — because g
 chunks in write order: a block-major file keeps each time block in its own few groups, so the hourly
 update re-uploads only the current block's groups. Peak memory is one block of one station.
 Measured on 400 stations × 150,000 steps with the earlier row-at-a-time writer: ~11 MB peak, against
-~480 MB for a single dense plane. **What this does NOT cover:** `series` is
-still a dict holding every station's arrays, so the *caller* carries ~24 B per stored observation
-for the whole build (~784 MB on a 33 M-observation source). On a large source that dict — not the
-write — is the ceiling.
+~480 MB for a single dense plane. The **dict** form of `series` still holds every station's arrays,
+so the *caller* carries ~24 B per stored observation for the whole build (~784 MB on a 33 M-observation
+source). For a large source, pass an iterable instead (below).
+
+**One station at a time (`series` as an iterable).** `series` may be an iterable — typically a
+generator — of `(ref, times, values, extras)`, so the build holds one station, never the dataset.
+It then needs `time_range=(t0, t1)`, the axis extent, because an iterable cannot be read ahead (a
+producer usually knows it from a cheap first pass). The guards the dict form applies to the whole
+series run per station. The facts it reads off the whole series become checks: every station in
+`stations` is yielded exactly once and has data, every stamp lies inside `time_range`, and the
+stamps present span `time_range` exactly. Rows follow `stations`, whatever the yield order. Writes
+go **station by station**, and a chunk where the station has neither a value nor an ancillary entry
+is **not written at all** (it reads back as NaN), so a sparse station on a long axis costs only the
+chunks it fills. The point chunk must be 1. The file is built at `<path>.partial` and renamed into
+place only after every check passes, so a failed rebuild leaves a previous file intact.
+
+```python
+def stations_one_at_a_time():
+    for ref in stations:
+        t, v, codes = load_and_resample(ref)          # the producer's own per-station work
+        yield ref, t, v, {'quality_code': codes}
+
+build_local('flow.cfdb', meta, stations, stations_one_at_a_time(),
+            time_range=(t_first, t_last), variable='streamflow', units='m^3/s',
+            precision=4, min_value=0, max_value=100_000, ancillary=QC_SPEC)
+```
+
+Station-major order is right for per-key storage. Grouped storage packs chunks in write order, so
+`build_and_publish` passes an iterator-built file through `rechunk_copy` (block-major) before a
+grouped publish. `rechunk_copy` writes every chunk, so that path gives up the empty-chunk skip. A
+station's stamps must be unique; duplicates raise.
+
+**Decoded dtype.** Storage is a packed integer either way, and `decoded_dtype` is the float type
+values pass through on the way in and out. `'float32'` (the default) holds about 7 significant
+digits, so a value is rounded to float32 *before* it is packed: the last declared decimal is lost in
+storage once `|value| × 10**precision` passes ~2²⁴, and decoding the file as float64 later cannot
+recover it. For streamflow at precision 4 the error
+grows with magnitude above ~1,000 m³/s, up to ~1.5e-3 near 16,000 m³/s (measured round trips,
+2026-10-13). `'float64'` returns the declared precision exactly, at
+twice the in-memory size when read.
+
+**Interval label.** The `time` coordinate carries `time_label` (and `interval_minutes`) derived from
+the metadata: `time_label='interval_start'` with the interval in minutes for any aggregated statistic,
+and `time_label='instant'` for `aggregation_statistic='point'`. Readers can relabel without parsing
+the description.
 
 ```python
 from envlib_ingest_base import build_local
@@ -324,6 +388,11 @@ and new steps, then read-modify-writes **one station at a time, each over its ow
 incoming values **only where they are non-NaN** — so a station that is offline this window (or an
 interval that resamples to NaN) is never clobbered. Idempotent for a fixed input window; a window
 entirely before the axis start raises (no history prepending). Returns a small report dict.
+
+A provider that corrects a continuing site's coordinates mints a new `station_id`, so the merge adds a
+**second row with the same `station_ref`**. That is the intended behaviour (envlib stores both and
+consumers decide continuity by `station_ref`), but it is logged as a warning naming the ref and both
+ids, and counted in the report as `new_rows_for_existing_refs`.
 
 **Memory is bounded by one station's window, not by the point dimension.** This previously read one
 contiguous block spanning *every* station, sized from the global min/max incoming timestamp — so a

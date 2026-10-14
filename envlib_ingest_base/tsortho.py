@@ -86,6 +86,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 
 import booklet
 import numpy as np
@@ -120,6 +121,8 @@ _DAY_US = 86_400_000_000
 _MIN_GROUP_BYTES = 64 * 1024
 # a series entry is (times, values) or (times, values, extras) — the 3rd slot carries ancillary data
 _SERIES_WITH_EXTRAS = 3
+# the float types a packed primary may decode to (storage is the same packed integer either way)
+_DECODED_DTYPES = ('float32', 'float64')
 # natural-unit ladder: the largest unit that divides the step becomes the stored coord unit
 _UNIT_US = (('D', 86_400_000_000), ('h', 3_600_000_000), ('m', 60_000_000), ('s', 1_000_000))
 
@@ -383,11 +386,130 @@ def _write_blocks(planes, stations: dict, series: dict, t0_us: int, n_times: int
                 var[i, b0:b1] = _nan_safe(seg, dt)
 
 
+def _check_time_range(time_range, step_us: int, code) -> tuple[int, int]:
+    """``(t0, t1)`` -> integer microseconds, both on the declared step grid and ``t0 <= t1``."""
+    try:
+        t0, t1 = (int(np.datetime64(x, 'us').astype('int64')) for x in time_range)
+    except (TypeError, ValueError) as e:
+        msg = f'time_range must be a (start, end) pair of datetimes, got {time_range!r}'
+        raise ValueError(msg) from e
+    for name, x in (('start', t0), ('end', t1)):
+        if x % step_us:
+            msg = f'time_range {name} {np.datetime64(x, "us")} is not aligned to frequency_interval {code!r}'
+            raise ValueError(msg)
+    if t0 > t1:
+        msg = f'time_range start {np.datetime64(t0, "us")} is after its end {np.datetime64(t1, "us")}'
+        raise ValueError(msg)
+    return t0, t1
+
+
+def _write_stream(
+    planes, stations: dict, series, roster, bounds, anc_bounds, t_range, step_us: int, block: int, code
+) -> tuple[int, int]:
+    """Write an ITERABLE series station by station; return the (value, ancillary) QC counts.
+
+    Each item is ``(ref, times, values, extras)``. Every guard the dict form runs on the whole
+    series runs here per station (alignment, the ancillary roster, QC), and the dict form's global
+    facts become checks: each ref is in ``stations`` and yielded exactly once; each yields something
+    that survives QC; every stamp lies inside ``t_range``; after the last one, all stations were
+    yielded and the stamps actually present span ``t_range`` exactly (the catalogue advertises the
+    axis, so an axis wider than the data would advertise coverage that does not exist).
+
+    A chunk is written only where the station has a value or an ancillary entry: an all-missing
+    chunk is simply absent (it reads back as NaN), so a sparse station on a long axis costs only
+    the chunks it fills. Rows come from the station's position in ``stations``, never from the
+    order of the iterable (see ``_write_blocks`` on why that matters).
+    """
+    t0_us, t1_us = t_range
+    n_times = (t1_us - t0_us) // step_us + 1
+    row = {ref: i for i, ref in enumerate(stations)}
+    seen = set()
+    n_qc = n_anc = 0
+    lo_seen = hi_seen = None
+    for item in series:
+        if len(item) != 4:  # noqa: PLR2004 - the iterable contract is a 4-tuple
+            msg = f'an iterable series yields (ref, times, values, extras); got a {len(item)}-tuple'
+            raise ValueError(msg)
+        ref, t, v, extras = item
+        if ref not in row:
+            msg = f'series yielded station {ref!r}, which is not in stations'
+            raise ValueError(msg)
+        if ref in seen:
+            msg = f'series yielded station {ref!r} twice'
+            raise ValueError(msg)
+        seen.add(ref)
+        one = _non_empty({ref: (t, v, extras or {})})
+        if not one:
+            msg = f'station {ref!r}: yielded no data (every station in stations must have data)'
+            raise ValueError(msg)
+        _check_extras(one, roster)
+        _check_aligned(one, step_us, code)
+        one, a, b = _qc_filter(one, bounds[0], bounds[1], anc_bounds)
+        n_qc += a
+        n_anc += b
+        tt, vv, ex = one[ref]
+        ti = tt.view('int64')
+        if ti.size > 1 and not bool((ti[1:] >= ti[:-1]).all()):
+            order = np.argsort(ti, kind='stable')
+            ti, vv, ex = ti[order], vv[order], {k: x[order] for k, x in ex.items()}
+        if ti.size > 1 and bool((ti[1:] == ti[:-1]).any()):
+            msg = f'station {ref!r}: duplicate timestamps (one value per step; dedupe upstream)'
+            raise ValueError(msg)
+        present = ~np.isnan(vv)
+        for x in ex.values():
+            present |= ~np.isnan(x)
+        if not present.any():
+            msg = f'station {ref!r}: nothing survives QC (no value and no ancillary entry)'
+            raise ValueError(msg)
+        ts = ti[present]
+        if ts[0] < t0_us or ts[-1] > t1_us:
+            msg = (
+                f'station {ref!r}: data {np.datetime64(int(ts[0]), "us")} .. {np.datetime64(int(ts[-1]), "us")} '
+                f'falls outside time_range {np.datetime64(t0_us, "us")} .. {np.datetime64(t1_us, "us")}'
+            )
+            raise ValueError(msg)
+        lo_seen = int(ts[0]) if lo_seen is None else min(lo_seen, int(ts[0]))
+        hi_seen = int(ts[-1]) if hi_seen is None else max(hi_seen, int(ts[-1]))
+        for k in np.unique((ts - t0_us) // (step_us * block)):
+            b0 = int(k) * block
+            b1 = min(b0 + block, n_times)
+            lo_us, hi_us = t0_us + b0 * step_us, t0_us + b1 * step_us
+            s0, s1 = (int(x) for x in np.searchsorted(ti, [lo_us, hi_us], side='left'))
+            idx = (ti[s0:s1] - lo_us) // step_us
+            for var, dt, plane in planes:
+                seg = np.full(b1 - b0, np.nan, dtype='float64')
+                arr = vv if plane is None else ex.get(plane)
+                if arr is not None:
+                    seg[idx] = arr[s0:s1]
+                var[row[ref], b0:b1] = _nan_safe(seg, dt)
+        # drop this station before asking for the next: otherwise the producer builds station
+        # n+1 while station n is still referenced here, and the peak is two stations, not one
+        del item, t, v, extras, one, tt, vv, ex, ti, present, ts
+    missing = [r for r in stations if r not in seen]
+    if missing:
+        msg = f'{len(missing)} station(s) in stations were never yielded, e.g. {missing[:5]}'
+        raise ValueError(msg)
+    if (lo_seen, hi_seen) != (t0_us, t1_us):
+        msg = (
+            f'time_range {np.datetime64(t0_us, "us")} .. {np.datetime64(t1_us, "us")} does not match the data, '
+            f'which spans {np.datetime64(lo_seen, "us")} .. {np.datetime64(hi_seen, "us")}'
+        )
+        raise ValueError(msg)
+    return n_qc, n_anc
+
+
+def _time_label_attrs(statistic, step_us: int) -> dict:
+    """The machine-readable interval label for the ``time`` coordinate, derived from the metadata."""
+    if statistic == 'point':
+        return {'time_label': 'instant'}
+    return {'time_label': 'interval_start', 'interval_minutes': int(step_us // 60_000_000)}
+
+
 def build_local(
     path,
     meta,
     stations: dict,
-    series: dict,
+    series,
     *,
     variable: str,
     units: str,
@@ -398,6 +520,8 @@ def build_local(
     standard_name=None,
     extra_var_attrs=None,
     ancillary=None,
+    time_range=None,
+    decoded_dtype='float32',
 ):
     """Create a fresh local ts_ortho cfdb from all stations + their resampled series.
 
@@ -418,6 +542,26 @@ def build_local(
     ``ancillary_variables`` attr naming them, which is also the roster ``merge_dataset`` reads
     back — the stored dataset, not a caller argument, is the single source of truth on update.
 
+    ``series`` may instead be an **iterable** of ``(ref, times, values, extras)`` — one station at
+    a time, so a build never holds the whole dataset in memory. It then needs ``time_range=(t0,
+    t1)``, the axis extent (the dict form derives it from the data it holds; an iterable cannot
+    look ahead). Every station in ``stations`` must be yielded exactly once and have data; the
+    stamps present must span ``time_range`` exactly. Rows are written station by station, and a
+    chunk where the station has neither a value nor an ancillary entry is not written at all. The
+    point chunk must be 1. Grouped publishing wants block-major chunk order, so
+    ``build_and_publish`` passes an iterator-built file through ``rechunk_copy`` first. The file is
+    built at a temporary path and renamed into place only once every check has passed.
+
+    ``decoded_dtype`` is the float type of the packed primary. Values pass through it on the way in
+    as well as out: with ``'float32'`` (about 7 significant digits) a value is rounded to float32
+    before it is packed, so the last declared decimal is lost in STORAGE once ``|value| *
+    10**precision`` passes ~2**24 (streamflow at precision 4 above ~1000), and no later read can
+    recover it. ``'float64'`` stores and returns the declared precision exactly.
+
+    The ``time`` coordinate carries a machine-readable interval label derived from the metadata:
+    ``time_label='interval_start'`` plus ``interval_minutes`` for an aggregated statistic, and
+    ``time_label='instant'`` for ``'point'``.
+
     Each ancillary is stored as a PACKED FLOAT (not an integer dtype): the whole merge/QC
     machinery is NaN-based, and an integer plane cannot express "no incoming code" at all.
     ``valid_min``/``valid_max`` are written from the declared bounds and are load-bearing, not
@@ -430,26 +574,35 @@ def build_local(
     attrs = meta.to_dict()
     _check_phase(attrs.get('envlib_utc_offset'), meta.frequency_interval)
     ancillary = ancillary or {}
-    non_empty = _non_empty(series)
-    if not non_empty:
-        msg = 'no series data to build from'
+    if decoded_dtype not in _DECODED_DTYPES:
+        msg = f'decoded_dtype must be one of {_DECODED_DTYPES}, got {decoded_dtype!r}'
         raise ValueError(msg)
-    _check_refs(non_empty, stations)
-    _check_extras(non_empty, ancillary)
-    _check_aligned(non_empty, step_us, meta.frequency_interval)
-
-    dt = dtypes.dtype('float32', precision=precision, min_value=min_value, max_value=max_value)
+    dt = dtypes.dtype(decoded_dtype, precision=precision, min_value=min_value, max_value=max_value)
     anc_bounds = {k: (float(s['min_value']), float(s['max_value'])) for k, s in ancillary.items()}
-    non_empty, n_qc, n_anc_qc = _qc_filter(non_empty, float(min_value), float(max_value), anc_bounds)
-    if n_qc:
-        logger.warning('build %s: %d value(s) outside [%s, %s] set to NaN (QC)', variable, n_qc, min_value, max_value)
-    if n_anc_qc:
-        logger.warning(
-            'build %s: %d ancillary value(s) outside their declared bounds set to NaN (QC)', variable, n_anc_qc
-        )
-
-    tmin = _floor_step(min(int(t.astype('int64').min()) for t, *_ in non_empty.values()), step_us)
-    tmax = _floor_step(max(int(t.astype('int64').max()) for t, *_ in non_empty.values()), step_us)
+    streaming = not isinstance(series, dict)
+    if streaming:
+        if time_range is None:
+            msg = 'an iterable series needs time_range=(t0, t1): the axis extent cannot be read ahead from it'
+            raise ValueError(msg)
+        if chunk_shape is not None and chunk_shape[0] != 1:
+            msg = f'an iterable series writes one station at a time and needs a point chunk of 1, got {chunk_shape}'
+            raise ValueError(msg)
+        tmin, tmax = _check_time_range(time_range, step_us, meta.frequency_interval)
+    else:
+        if time_range is not None:
+            msg = 'time_range is for an iterable series; a dict series derives the axis from its own data'
+            raise ValueError(msg)
+        non_empty = _non_empty(series)
+        if not non_empty:
+            msg = 'no series data to build from'
+            raise ValueError(msg)
+        _check_refs(non_empty, stations)
+        _check_extras(non_empty, ancillary)
+        _check_aligned(non_empty, step_us, meta.frequency_interval)
+        non_empty, n_qc, n_anc_qc = _qc_filter(non_empty, float(min_value), float(max_value), anc_bounds)
+        _warn_qc(variable, n_qc, n_anc_qc, min_value, max_value)
+        tmin = _floor_step(min(int(t.astype('int64').min()) for t, *_ in non_empty.values()), step_us)
+        tmax = _floor_step(max(int(t.astype('int64').max()) for t, *_ in non_empty.values()), step_us)
     times_us = np.arange(tmin, tmax + 1, step_us)
     # NOTE: the dense plane is NOT assembled here. Blocks are written individually inside the
     # dataset context below (see _write_blocks) so peak memory is one block, not one plane.
@@ -468,10 +621,42 @@ def build_local(
 
     unit_us = dict(_UNIT_US).get(unit, 1)
     tvals = times_us.astype('datetime64[us]').astype(f'datetime64[{unit}]')
-    with open_dataset(str(path), flag='n', dataset_type='ts_ortho') as ds:
+    target = f'{path}.partial' if streaming else str(path)
+    try:
+        _build_file(
+            target, attrs, stations, points, ids, names, refs, tvals, step_us, unit_us, chunk_shape, variable, units,
+            dt, min_value, max_value, standard_name, extra_var_attrs, ancillary, anc_bounds,
+            series if streaming else non_empty, streaming, tmin, tmax, meta,
+        )
+    except BaseException:
+        if streaming and os.path.exists(target):
+            os.remove(target)
+        raise
+    if streaming:
+        os.replace(target, str(path))
+    return str(path)
+
+
+def _warn_qc(variable, n_qc, n_anc_qc, min_value, max_value) -> None:
+    if n_qc:
+        logger.warning('build %s: %d value(s) outside [%s, %s] set to NaN (QC)', variable, n_qc, min_value, max_value)
+    if n_anc_qc:
+        logger.warning(
+            'build %s: %d ancillary value(s) outside their declared bounds set to NaN (QC)', variable, n_anc_qc
+        )
+
+
+def _build_file(
+    target, attrs, stations, points, ids, names, refs, tvals, step_us, unit_us, chunk_shape, variable, units,
+    dt, min_value, max_value, standard_name, extra_var_attrs, ancillary, anc_bounds, series, streaming, tmin, tmax,
+    meta,
+) -> None:  # fmt: skip
+    """The body of ``build_local`` once inputs are validated: create the file and write it."""
+    with open_dataset(str(target), flag='n', dataset_type='ts_ortho') as ds:
         ds.create.coord.point()
         ds['point'].append(points)
         ds.create.coord.time(data=tvals, step=int(step_us // unit_us))
+        ds['time'].attrs.update(_time_label_attrs(meta.aggregation_statistic, step_us))
         ds.create.crs.from_user_input(4326, xy_coord='point')
 
         dv = ds.create.data_var.generic(variable, ('point', 'time'), dtype=dt, chunk_shape=chunk_shape)
@@ -505,8 +690,15 @@ def build_local(
             av.attrs['valid_max'] = float(spec['max_value'])
             planes.append((av, adt, aname))
 
-        # every plane in one block-major pass, so a value and its ancillary grade land together
-        _write_blocks(planes, stations, non_empty, tmin, times_us.size, step_us, chunk_shape[1])
+        if streaming:
+            n_qc, n_anc_qc = _write_stream(
+                planes, stations, series, ancillary, (float(min_value), float(max_value)), anc_bounds,
+                (tmin, tmax), step_us, chunk_shape[1], meta.frequency_interval,
+            )
+            _warn_qc(variable, n_qc, n_anc_qc, min_value, max_value)
+        else:
+            # every plane in one block-major pass, so a value and its ancillary grade land together
+            _write_blocks(planes, stations, series, tmin, (tmax - tmin) // step_us + 1, step_us, chunk_shape[1])
 
         sid = ds.create.data_var.generic(STATION_ID_VAR, ('point',), dtype=dtypes.dtype('str'))
         sid[:] = ids
@@ -528,7 +720,6 @@ def build_local(
 
         _apply_station_attrs(ds)
         ds.attrs.update(attrs)
-    return str(path)
 
 
 def merge_dataset(ds, stations: dict, series: dict, *, variable: str):
@@ -586,6 +777,7 @@ def merge_dataset(ds, stations: dict, series: dict, *, variable: str):
             'qc_rejected': 0,
             'anc_qc_rejected': 0,
             'dropped_before_axis': 0,
+            'new_rows_for_existing_refs': 0,
         }
     _check_refs(non_empty, stations)
     _check_aligned(non_empty, step_us, code)
@@ -635,6 +827,20 @@ def merge_dataset(ds, stations: dict, series: dict, *, variable: str):
     id_to_row = {sid: i for i, sid in enumerate(cur_ids)}
     new_mask = np.array([sid not in id_to_row for sid in ids])
     n_new = int(new_mask.sum())
+    # A provider that changes a continuing site's coordinates gets a NEW row for the same ref (the
+    # intended behaviour: envlib stores both, consumers decide continuity by station_ref). Say so,
+    # because nothing else would: the run succeeds and the old row simply stops receiving data.
+    stored_ids = {}
+    stored_refs = ds[STATION_REF_VAR].data if STATION_REF_VAR in ds else []  # pre-station_ref datasets
+    for sid, sref in zip(cur_ids, stored_refs, strict=False):  # empty when the var is absent
+        stored_ids.setdefault(str(sref), []).append(str(sid))
+    moved = [(str(r), stored_ids[str(r)], str(i)) for r, i, m in zip(refs, ids, new_mask, strict=True)
+             if m and str(r) in stored_ids]
+    for ref, old, new in moved:
+        logger.warning(
+            'merge %s: station_ref %r gains a new row %s beside existing %s (its coordinates changed)',
+            variable, ref, new, old,
+        )
     if n_new:
         ds['point'].append([p for p, m in zip(points, new_mask, strict=True) if m])
         base = len(cur_ids)
@@ -746,6 +952,7 @@ def merge_dataset(ds, stations: dict, series: dict, *, variable: str):
         'gap_steps': int(gap_steps),
         'qc_rejected': int(n_qc),
         'anc_qc_rejected': int(n_anc_qc),
+        'new_rows_for_existing_refs': len(moved),
         'dropped_before_axis': int(n_before),
     }
 
@@ -915,8 +1122,25 @@ def build_and_publish(cat, path, member_conn, rcg_conn, meta, stations, series, 
     companion ``(point, time)`` planes (e.g. a per-timestep quality grade), whose data rides in
     each ``series`` entry's third tuple slot. ``update_and_publish`` needs no equivalent argument:
     the roster is read back from the stored dataset's ``ancillary_variables`` attr.
+
+    An iterable ``series`` is written station by station (see ``build_local``). Grouped storage
+    packs chunks in write order and wants them block-major, so for a grouped publish the
+    station-major file is rewritten block by block with ``rechunk_copy`` before publishing; per-key
+    storage (``group_bytes=None``) publishes it as built.
     """
-    build_local(path, meta, stations, series, **build_kwargs)
+    if not isinstance(series, dict) and group_bytes is not None:
+        staged = f'{path}.station-major'
+        build_local(staged, meta, stations, series, **build_kwargs)
+        try:
+            with (
+                open_dataset(staged, flag='r') as src,
+                open_dataset(str(path), flag='n', dataset_type='ts_ortho') as dst,
+            ):
+                rechunk_copy(src, dst, time_chunk=src[build_kwargs['variable']].chunk_shape[1])
+        finally:
+            os.remove(staged)
+    else:
+        build_local(path, meta, stations, series, **build_kwargs)
     if group_bytes == 'auto':
         group_bytes = group_bytes_for(path, build_kwargs['variable'])
         logger.info('publish %s: grouped, group_bytes=%d', build_kwargs['variable'], group_bytes)
