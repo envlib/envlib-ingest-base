@@ -1108,7 +1108,8 @@ def compare_datasets(a, b, *, block: int = _MIN_TIME_CHUNK) -> list:
     return diffs
 
 
-def build_and_publish(cat, path, member_conn, rcg_conn, meta, stations, series, *, group_bytes='auto', **build_kwargs):
+def build_and_publish(cat, path, member_conn, rcg_conn, meta, stations, series, *, group_bytes='auto', lock_lease=None,
+                      **build_kwargs):
     """First publish: build a local ts_ortho cfdb and publish it to the commons (data then RCG entry).
 
     ``group_bytes='auto'`` (default) publishes grouped with ``group_bytes_for(path, variable)``:
@@ -1127,6 +1128,9 @@ def build_and_publish(cat, path, member_conn, rcg_conn, meta, stations, series, 
     packs chunks in write order and wants them block-major, so for a grouped publish the
     station-major file is rewritten block by block with ``rechunk_copy`` before publishing; per-key
     storage (``group_bytes=None``) publishes it as built.
+
+    ``lock_lease`` (seconds; ebooklet >= 0.12) declares the publish session's maximum hold on
+    the dataset's write lock - see ``update_and_publish``. ebooklet refuses it for per-key storage.
     """
     if not isinstance(series, dict) and group_bytes is not None:
         staged = f'{path}.station-major'
@@ -1144,17 +1148,29 @@ def build_and_publish(cat, path, member_conn, rcg_conn, meta, stations, series, 
     if group_bytes == 'auto':
         group_bytes = group_bytes_for(path, build_kwargs['variable'])
         logger.info('publish %s: grouped, group_bytes=%d', build_kwargs['variable'], group_bytes)
-    return cat.publish(str(path), member_conn, rcg_conn, group_bytes=group_bytes)
+    return cat.publish(str(path), member_conn, rcg_conn, group_bytes=group_bytes, **_lease_kw(lock_lease))
 
 
-def update_and_publish(cat, path, member_conn, rcg_conn, stations, series, *, variable):
+def _lease_kw(lock_lease):
+    """``lock_lease`` as a keyword only when declared (fakes and older callers need not know it)."""
+    return {} if lock_lease is None else {'lock_lease': lock_lease}
+
+
+def update_and_publish(cat, path, member_conn, rcg_conn, stations, series, *, variable, lock_lease=None):
     """Incremental update: pull the remote, merge the recent window, then publish (diff + entry refresh).
 
     ``path`` is a local working cache linked to ``member_conn``; the merge reads only the coords +
     the affected time block, so no full-remote materialization is required. The storage mode is
     the existing remote's (fixed at first publish), so none is passed here.
+
+    ``lock_lease`` (seconds; ebooklet >= 0.12) declares a maximum hold on the dataset's write lock
+    for BOTH sessions this opens (the merge, then the publish), so a run that dies or stalls
+    holding it blocks the next run for at most the lease (+ 60 s): the next writer breaks the
+    expired ticket. Declare one comfortably above the longest healthy session, well under the
+    cron interval. ebooklet refuses it for per-key storage. The catalogue entry's own lock (the
+    commons RCG) is not leased: the catalogue is per-key (OPEN_WORK "Lease the commons catalogue").
     """
-    with open_edataset(member_conn, str(path), flag='w') as ds:
+    with open_edataset(member_conn, str(path), flag='w', **_lease_kw(lock_lease)) as ds:
         report = merge_dataset(ds, stations, series, variable=variable)
-    result = cat.publish(str(path), member_conn, rcg_conn)
+    result = cat.publish(str(path), member_conn, rcg_conn, **_lease_kw(lock_lease))
     return {'merge': report, 'publish': result}

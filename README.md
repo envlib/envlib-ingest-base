@@ -489,6 +489,18 @@ needs `variable` (the dataset already exists). Both push the cfdb data **before*
 and a crash between the two leaves the entry's advertised time-range safely *behind* the data (the next
 run heals it).
 
+**Lock leases** (0.8, ebooklet ≥ 0.12): both take `lock_lease=<seconds>`, a maximum hold on the
+dataset's write lock for every session they open (`update_and_publish`: the merge, then the
+publish).
+- If a run dies or stalls while holding the lock, the next run that waits on it breaks the expired
+  ticket instead of timing out until someone breaks it by hand.
+- The stalled run's own commit is fenced and refused after its deadline.
+- Declare a lease comfortably above the longest healthy session and well under the cron interval.
+  For ECan's hourly runs that is `LOCK_LEASE` in `envlib-ingest-ecan-env/raw/config.py`.
+- ebooklet refuses a lease for per-key storage (`group_bytes=None`).
+- The commons catalogue's lock stays unleased: the catalogue is per-key (OPEN_WORK "Lease the
+  commons catalogue").
+
 ---
 
 ## Develop

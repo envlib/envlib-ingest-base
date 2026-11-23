@@ -19,7 +19,7 @@ from envlib_ingest_base.tsortho import (
     update_and_publish,
 )
 
-__version__ = '0.7.0'
+__version__ = '0.8.0'
 __all__ = [
     'build_and_publish',
     'build_and_push',

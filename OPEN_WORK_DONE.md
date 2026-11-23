@@ -4,6 +4,47 @@ Completed items from `OPEN_WORK.md` (the datasets/ingestion track), moved here o
 
 ## Done (newest first)
 
+- [x] ~~**The forward year's local backups on sky** (`~/data/wrf/cfdb_backup_append_2026/`, 521 GB, and the
+  scratch dir `~/scratch_wrf3k_append/`): delete on Mike's go; close-check: the dirs are gone.~~ (a "Still open"
+  entry of the wrf-3k follow-ups) — **CLOSED 2026-11-13:** Mike deleted both. Sky's disk is at 56 % (1.6 TB free).
+
+- [x] ~~**precipitation's 107 orphan groups** (from the push killed on 2026-11-10; the 1980s prepend record,
+  `envlib-ingest-wrf-3k/docs/1980s-prepend.md`). Harmless to readers. Sweeping them is Mike's call;
+  close-check: fsck shows 0 orphans.~~ (a "Still open" entry of the wrf-3k follow-ups) — **CLOSED 2026-11-13.**
+  A report-only fsck listed exactly the 107 objects uploaded on 2026-11-10 (3.56 GB), and nothing else was wrong.
+  Mike then ran `fsck(delete_orphans=True)` on sky, through a script that refused to sweep on any difference.
+  Afterwards the remote holds 459 objects (15.38 GB, the size of the local file), and `verify_remote.py --n-bands
+  30` passed: 10,304 chunks byte-equal through the public URL, and fsck shows 0 orphans and 0 missing objects.
+
+- [x] ~~**[ingest/wrf-3k] Extend to the whole run, 1980-01-07 → 2026-07-01**~~ (a sub-item of the wrf-3k follow-ups) —
+  **CLOSED 2026-11-12.** The forward year was published and verified on 2026-11-12, after the 1980s prepend
+  (2026-11-11). All 11 time-varying datasets now run 1980-01-07 → 2026-07-01T00:00 (precipitation to
+  2026-06-30T23:00) in the public catalogue, under unchanged ids with `[1980-2026]` in their attribution. Every
+  band of every dataset was read back byte-equal through the public URL, and fsck is clean apart from
+  precipitation's 107 known orphans. Publication rows: `envlib-ingest-wrf-3k/PROVENANCE.md`; the record:
+  `envlib-ingest-wrf-3k/docs/forward-year-2025-26.md`; plan review `wrf3k-append-plan-1`. Open follow-up:
+  deleting the forward year's backups on sky (Mike's go), in "Still open".
+  Was:
+  - **Extend to the whole run, 1980-01-07 → 2026-07-01** (widened 2026-11-09). The run is complete except
+    2026-02-23 → 04-05, and every source file is on sky's network mount. The first d03 file is 1980-01-07; the
+    days 1980-01-01..06 are absent by design. The static terrain stays stamped 1980-01-01. Split in two:
+    - **The forward year 2025-07 → 2026-07, RUNNING since 2026-11-12.** The 7 weekly runs that had failed in
+      `era5_to_int` on foreign-format March 2026 ERA5 files were re-run (closed in the WRF hub's
+      `OPEN_WORK_DONE.md`), and the preflight over 2025-07-01 → 2026-07-01 passed. It is a
+      plain append with `ERA5_YEARS = '1980-2026'`. It rewrites the partly filled last band (217 of 840 rows
+      hourly, 185 of 360 daily). Planned and plan-reviewed on 2026-11-11 (round `wrf3k-append-plan-1`, Fable 5.2 +
+      Sonnet 5.5). The driver is on sky in `~/scratch_wrf3k_append/`, and the record is
+      `envlib-ingest-wrf-3k/docs/forward-year-2025-26.md`.
+
+- [x] ~~**The 1980s prepend's local backups on sky** (`~/data/wrf/cfdb_backup_20261110/`, ~430 GB, and the
+  scratch dirs under `~/scratch_wrf3k/`): delete on Mike's go; close-check: the dirs are gone.~~ (a "Still open"
+  entry of the wrf-3k follow-ups) — **CLOSED 2026-11-11:** both were gone from sky when checked during the
+  forward-year planning (Mike deleted them).
+
+- [x] ~~**[ingest/wrf-3k] The 1980s prepend (1980-01-07 → 1990-06-30) of the 11 WRF 3 km datasets**~~ (a sub-item of "Follow-ups to the published WRF 3 km precipitation", "Extend to the whole run") — **CLOSED 2026-11-11.** All 11 show `time_start` 1980-01-07 in the public catalogue under their unchanged ids, and `verify_remote` PASSED for each (every band for snow, soil and precipitation). fsck is clean apart from precipitation's 107 known orphan groups from the push killed on 2026-11-10. The nine hourly publishes needed booklet 0.12.11 (envlib `OPEN_WORK_DONE.md`, 2026-11-11). Publication rows: `envlib-ingest-wrf-3k/PROVENANCE.md`; the record: `envlib-ingest-wrf-3k/docs/1980s-prepend.md`. This was also the first extension with only the new days of source online (the per-write gate's purpose), which closes that still-open entry too. Open follow-ups: deleting the D4 backups on sky (Mike's go), sweeping precipitation's 107 orphans (a separate ask), and the forward year, which stays in the item.
+
+- [x] ~~**[ingest/wrf-3k] Review the WRF datasets' `owner=uc`**~~ (a sub-item of "Follow-ups to the published WRF 3 km precipitation", added 2026-11-06) — **CLOSED 2026-11-09 (Mike): keep `owner=uc`.** The ids stay as they are, so the extension to 1980-01-01 → 2026-07-01 goes ahead on the current datasets before the 18 November 2026 talk. The item as written: "The publisher is unsure the owner label is the intended one. Owner is identity-hashed, so a change means new dataset ids, and thalweg's pinned builds refuse them until re-pinned. Left unchanged until after the 18 November 2026 talk."
+
 - [x] ~~**[ingest/wrf-3k] The direction-geography bound: record the full-record maximum**~~ (a sub-item of "Follow-ups to the published WRF 3 km precipitation") — **CLOSED 2026-10-18 (Mike): closed on the 2026-10-06 PASS of the full record against the 0.5 deg bound; the exact maximum is not recovered.** The text as it stood: **The direction-geography bound (0.5 deg)** was calibrated on Jul-Dec 1990 only; the full record passed it, so record its maximum from `logs/verify_build_wind_direction.json` (`7_values.geo_max_deg`). **That value is gone (2026-10-18):** the format-3 republish's pre-check re-ran the gate with no new labels and overwrote the record (`geo_max_deg: 0.0`, nothing compared). The 2026-10-06 PASS of the full record against 0.5 stands. Recovering the number needs a one-off script over the archive. Mike's call: close on the PASS, or recompute.
 
 - [x] ~~**[ingest/ecan + app + envlib + ebooklet] Roll ebooklet 0.11 (storage format 3) and the telemetry layout out to the live datasets — the code is released (see `OPEN_WORK_DONE.md`, 2026-10-09, and envlib's `OPEN_WORK_DONE.md`, the write-order-groups entry); the catalogue and the three ECan datasets moved 2026-10-14/15, esa-sst and the 12 WRF-3k datasets 2026-10-18; one confirmation (step 5) and the backups (step 8) remain.**~~ — **CLOSED 2026-10-18.** Every live remote is on the new stack: the catalogue per-key (format 2), the ECan telemetry datasets and the 13 esa-sst/WRF-3k datasets format 3, no hash-grouped remote left. Step 5's last check passed (Mike, 2026-10-18: `/ashburton` shows new data without a restart). Step 8 is its own open item, "Delete the 2026-10 rollout backups after a soak". This is the one checklist for both rollouts. It merges this file's telemetry item with the open step 4 of envlib's write-order-groups item (moved here 2026-10-09). The layout was decided by Mike on 2026-10-08: one station × 2520-step chunks in small write-order groups, for continuously updated station telemetry. It replaces the 2026-07-20 per-key ruling and the `(1, 25_000)` default. The plan, both review records and Mike's decisions (D1–D4, D-a to D-d, run conditions P1–P3) are in `~/.claude/plans/please-read-the-first-splendid-moon.md`. The write-order-groups plan's step 4 is `~/git/ebooklet/planning/write-order-groups-plan.md`, superseded in part by this list.
