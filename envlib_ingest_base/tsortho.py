@@ -84,14 +84,16 @@ with the ebooklet edataset + ``envlib.Catalogue`` publish.
 
 from __future__ import annotations
 
+import glob
 import logging
 import math
 import os
+import pathlib
 
 import booklet
 import numpy as np
 from cfdb import dtypes, open_dataset, open_edataset
-from ebooklet import DEFAULT_GROUP_BYTES
+from ebooklet import DEFAULT_GROUP_BYTES, LockLostError
 from envlib.vocabularies import frequency_entry
 from rechunkit.main import composite_numbers
 
@@ -1169,8 +1171,38 @@ def update_and_publish(cat, path, member_conn, rcg_conn, stations, series, *, va
     expired ticket. Declare one comfortably above the longest healthy session, well under the
     cron interval. ebooklet refuses it for per-key storage. The catalogue entry's own lock (the
     commons RCG) is not leased: the catalogue is per-key (OPEN_WORK "Lease the commons catalogue").
+
+    The merge session never pushes, so ebooklet never checks its lock. It is checked here before
+    the session closes. If it was lost (the lease ran out during a stall and another writer may
+    have broken the ticket and committed since), this raises ``LockLostError`` and deletes the
+    working cache ``path`` with its sidecars. That merge was computed against a remote that may
+    have moved on, and publishing it, now or from a reused cache later, would silently roll the
+    newer commit back. The next run starts again from the remote.
     """
     with open_edataset(member_conn, str(path), flag='w', **_lease_kw(lock_lease)) as ds:
         report = merge_dataset(ds, stations, series, variable=variable)
+        lost = _lock_lost(ds)
+    if lost is not None:
+        _discard_working_cache(path)
+        raise LockLostError(f'the merge session lost its write lock ({lost}) before it closed; the merge '
+                            f'was discarded (working cache {str(path)!r} deleted) and nothing was published.')
     result = cat.publish(str(path), member_conn, rcg_conn, **_lease_kw(lock_lease))
     return {'merge': report, 'publish': result}
+
+
+def _lock_lost(ds):
+    """None if the session's write lock still holds (or it has none), else why it was lost."""
+    lock = getattr(getattr(ds, '_blt', None), 'lock', None)  # cfdb EDataset -> its ebooklet session
+    if lock is None or lock.verify():
+        return None
+    reason = getattr(lock, 'lost_reason', None)
+    return {'lease_expired': 'its lease ran out', 'broken': 'its ticket was broken by another writer'}.get(
+        reason, reason or 'reason unknown'
+    )
+
+
+def _discard_working_cache(path):
+    """Delete a local working cache and ebooklet's sidecars beside it (``<name>.remote_index`` etc.)."""
+    p = pathlib.Path(path)
+    for f in [p, *p.parent.glob(glob.escape(p.name) + '.*')]:
+        f.unlink(missing_ok=True)

@@ -35,6 +35,55 @@ def test_update_and_publish_forwards_the_lease_to_both_sessions(monkeypatch, lea
     assert cat.calls == [kw]                        # the publish session
 
 
+class FakeLock:
+    def __init__(self, holds, reason=None):
+        self.holds, self.lost_reason, self.verified = holds, reason, 0
+
+    def verify(self):
+        self.verified += 1
+        return self.holds
+
+
+class FakeEDataset:
+    def __init__(self, lock):
+        self._blt = type('Blt', (), {'lock': lock})()
+
+
+def _run_with_lock(monkeypatch, tmp_path, lock):
+    @contextlib.contextmanager
+    def fake_open(conn, path, flag, **kw):
+        yield FakeEDataset(lock)
+    monkeypatch.setattr(tsortho, 'open_edataset', fake_open)
+    monkeypatch.setattr(tsortho, 'merge_dataset', lambda ds, stations, series, variable: {'merged': True})
+    work = tmp_path / 'w.cfdb'
+    for name in ('w.cfdb', 'w.cfdb.remote_index', 'w.cfdb.changelog', 'w.cfdbx', 'other.cfdb'):
+        (tmp_path / name).write_bytes(b'x')
+    cat = RecordingCat()
+    return cat, work, lambda: tsortho.update_and_publish(cat, work, 'm', 'r', {}, {}, variable='v', lock_lease=1500)
+
+
+@pytest.mark.parametrize('reason', ['lease_expired', 'broken'])
+def test_a_merge_that_lost_its_lock_is_discarded_and_not_published(monkeypatch, tmp_path, reason):
+    """Round ecan-lease-code-1, finding 1: a stalled merge must not be published over a newer commit."""
+    lock = FakeLock(holds=False, reason=reason)
+    cat, work, run = _run_with_lock(monkeypatch, tmp_path, lock)
+    with pytest.raises(tsortho.LockLostError, match='merge session lost its write lock'):
+        run()
+    assert lock.verified == 1
+    assert cat.calls == [], 'nothing may be published'
+    # the working cache and its sidecars are gone; files that merely share a prefix are kept
+    assert sorted(p.name for p in tmp_path.iterdir()) == ['other.cfdb', 'w.cfdbx']
+
+
+def test_a_merge_whose_lock_holds_is_published(monkeypatch, tmp_path):
+    lock = FakeLock(holds=True)
+    cat, work, run = _run_with_lock(monkeypatch, tmp_path, lock)
+    assert run()['publish'] == 'ok'
+    assert lock.verified == 1
+    assert cat.calls == [{'lock_lease': 1500}]
+    assert work.exists()
+
+
 @pytest.mark.parametrize('lease', [None, 1500])
 def test_build_and_publish_forwards_the_lease(tmp_path, lease):
     cat = RecordingCat()

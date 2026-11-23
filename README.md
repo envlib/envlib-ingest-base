@@ -495,6 +495,11 @@ publish).
 - If a run dies or stalls while holding the lock, the next run that waits on it breaks the expired
   ticket instead of timing out until someone breaks it by hand.
 - The stalled run's own commit is fenced and refused after its deadline.
+- **The merge session's lock is checked before it closes (0.8.1).** That session never pushes, so
+  ebooklet never checks it. If its lock was lost, `update_and_publish` raises `LockLostError`,
+  deletes the working cache (`path` and its sidecars), and publishes nothing. Before 0.8.1, a
+  merge that stalled past its lease could resume and publish its stale result over a newer
+  commit, without an error.
 - Declare a lease comfortably above the longest healthy session and well under the cron interval.
   For ECan's hourly runs that is `LOCK_LEASE` in `envlib-ingest-ecan-env/raw/config.py`.
 - ebooklet refuses a lease for per-key storage (`group_bytes=None`).
