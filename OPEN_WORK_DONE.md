@@ -4,6 +4,32 @@ Completed items from `OPEN_WORK.md` (the datasets/ingestion track), moved here o
 
 ## Done (newest first)
 
+- [x] **[ebooklet+s3func] Lease-style lock expiry** — **CLOSED 2026-11-24:** ECan's hourly cron runs leased (`:0.11`, toolkit 0.8.1), and every close-check passed: the tickets carry `l1500`, the runs succeed, a planted orphan was cleared by the next writer, and fsck is clean on the three datasets. Follow-ups stay open as their own items in `OPEN_WORK.md`: "Lease the commons catalogue", "Other scheduled writers declare lock leases", "Release locks on SIGTERM", "ECan cron: a run deadline and a missed-run alarm", and the s3func, envlib and ECan-test items added 2026-11-24. (Added 2026-10-14 as "A crashed writer's lock ticket stalls a dataset's hourly cron forever"; re-scoped by Mike 2026-10-15; deferred until the 2026-11-22 incident met its revisit trigger, then planned and approved 2026-11-23).
+  - **Incidents:** the second orphan (2026-11-22, `uswest9` degrading for ~23 h; three stalled runs left complete tickets on all three ECan datasets) and the history of the first (2026-10-13) with the 2026-10-15 ruling are in `planning/lock-lease-2026-11.md`.
+  - **Plan:** `~/.claude/plans/yeah-the-lease-option-harmonic-peacock-of-28de0bb2-7ee3-40c1-bc91-2b0aba052259.md`, draft 2. It was reviewed in round `lock-lease-plan-1` (Fable 5.2 and Sonnet 5.5; results in `~/git/ai-review-harness/results/lock-lease-plan-1/`).
+    - Holder-declared lease in the lock id, judged on the server clock.
+    - Waiters break expired blockers, and holders' `verify()` expires first.
+    - An ebooklet commit guard for every writer: a pre-commit HEAD stamp check, a verify before the post-commit cleanup, and for leased sessions a presigned commit PUT that expires at the lease deadline.
+    - Leases refused on per-key remotes and `flag='n'` sessions.
+  - **Status (2026-11-24):** Steps 1, 2 and 4 are released. Step 3 is dropped. Step 5 (ECan) is built and reviewed, and it waits on the envlib-ingest-base 0.8.1 release (the merge-session lock check that review round `ecan-lease-code-1` found missing).
+    - **Releases:** s3func 0.10.0, ebooklet 0.12.0 (and 0.13.0 on top) and envlib-ingest-base 0.8.0 are released and committed. Their review rounds and checks are in `planning/lock-lease-2026-11.md`, "Releases".
+    - **Downstream locks** are on ebooklet 0.13.0, s3func 0.10.0 and booklet 0.12.11, with suites passing (2026-11-24): cfdb 521 passed, envlib 187, flow-forecast-app-envlib 91, and -ecan-env graphql 54. cfdb and envlib were already on 0.13.0 and committed. The locks of -ecan-env, -esa-sst, -wrf-3k and flow-forecast-app-envlib are NOT committed.
+    - **Step 3 is dropped** (Mike, 2026-11-23): the live commons catalogue is per-key storage (`format_version` 2, no `num_groups`), and leases are refused for per-key sessions. It stays unleased, tracked as "Lease the commons catalogue".
+    - **Step 5, ECan** (`~/git/envlib-repos/ingest/envlib-ingest-ecan-env`) is built, reviewed in round `ecan-lease-code-1` and fixed, all uncommitted. The build record, the planted-orphan check (passed) and the review verdicts are in `planning/lock-lease-2026-11.md`.
+      - **envlib-ingest-base 0.8.1 is released** (committed `e163a33`; its wheel's modules match the commit).
+        - ECan's lock is on toolkit 0.8.1, ebooklet 0.13.0 and cfdb 0.12.0. cfdb 0.12.0 came from a different session (the read-backend refactor, `d4ed66c`).
+        - The base image `envlib-ingest-base:0.8.1` was built from PyPI, and ECan `:0.11` on top of it, both locally and NOT pushed. Inside it, pip reports toolkit 0.8.1, ebooklet 0.13.0, s3func 0.10.0, cfdb 0.12.0 and booklet 0.12.11. The lease tests pass in it (10, including the end-to-end rollback test).
+      - **Deployed 2026-11-24 ~00:00 UTC.** Both images were pushed (base `0.8.1` `sha256:53ae80a9…`, ECan `:0.11` `sha256:3b1e51e1…`). Mike ran `docker stack deploy` with nothing running, and 0 tickets were on all four keys before and after.
+      - **The first `:0.11` run (00:49 UTC) passed the production close-checks.** Watched read-only, with tickets polled every 10 s:
+        - every dataset ticket seen carried `l1500` (4 of 4), and both catalogue tickets had no lease;
+        - all three datasets and the catalogue committed (00:50:19–00:53:21);
+        - 0 tickets were left;
+        - fsck was clean on all three (0 missing, 0 orphans, not torn).
+    - **The lease is 1500 s (25 min).** The derivation is next to `LOCK_LEASE` in ECan's `raw/config.py`.
+    - **ECan's tests** need `PYTHONPATH=.:graphql` (and `.:raw`). The only `raw/tests` file cannot import `ebooklet.tests` from the wheel; that predates this work and is tracked as "ECan raw tests import ebooklet's test fake".
+    - **Step 0 is closed as unknowable** (2026-11-24). Contabo migrated the failing `uswest9` VPS to a new one, and Mike set the node active again. `journalctl --list-boots` on the new VM shows no earlier boots, so the 2026-11-21/22 logs went with the old VM. The lease clears an orphan however the runs died. When the node returned nothing resumed: a read-only check at 2026-11-23 20:46 UTC found 0 tickets on the three ECan datasets and on the commons catalogue, and fsck clean on all three datasets. "Release locks on SIGTERM" is therefore general hardening, not a known part of this failure.
+  - **Close-check:** ECan run tickets carry the lease suffix; runs succeed; a planted abandoned leased ticket on a scratch remote is cleared by the next contender; fsck is clean on the three ECan remotes.
+
 - [x] ~~**The forward year's local backups on sky** (`~/data/wrf/cfdb_backup_append_2026/`, 521 GB, and the
   scratch dir `~/scratch_wrf3k_append/`): delete on Mike's go; close-check: the dirs are gone.~~ (a "Still open"
   entry of the wrf-3k follow-ups) — **CLOSED 2026-11-13:** Mike deleted both. Sky's disk is at 56 % (1.6 TB free).

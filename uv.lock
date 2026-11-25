@@ -151,7 +151,7 @@ wheels = [
 
 [[package]]
 name = "ebooklet"
-version = "0.13.0"
+version = "0.13.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "booklet" },
@@ -160,14 +160,14 @@ dependencies = [
     { name = "s3func" },
     { name = "urllib3" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/02/8c/13ac9527e8d06bb5c08dd9b66a19fd773683e867314832095bd7363f9fa6/ebooklet-0.13.0.tar.gz", hash = "sha256:4d4cb51bd17f8071b72dce4456b41d27588e25d99b755db6a198741bc9a8ee3a", size = 92878, upload-time = "2026-11-23T19:56:43.876Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/23/b9/11ee96cb6e37b90a58215fcf455d9d8bc7f12a0a9b891d6571c23df430f3/ebooklet-0.13.2.tar.gz", hash = "sha256:7e3cf0909f001af01d2130ffe10dca814be80a4b34c2c969fdd095f4209a201d", size = 93841, upload-time = "2026-11-24T18:17:29.865Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/91/09/2f83c713b1923cf681bbe670d963acfbf76c7e0254e71f39ab010a49e100/ebooklet-0.13.0-py3-none-any.whl", hash = "sha256:74f2ee2fee55e3f838469ac9653b042e641c8dd2bc080c20a38d689508a96479", size = 98641, upload-time = "2026-11-23T19:56:42.533Z" },
+    { url = "https://files.pythonhosted.org/packages/f0/8c/537a72fa79fb94a7fc9390c740319a947d2968b0b31239ce6b6ecbee86e9/ebooklet-0.13.2-py3-none-any.whl", hash = "sha256:4dcd5406cfc0764b9019cfef23b86ab54dd4616907dab014b285923609d44a13", size = 99675, upload-time = "2026-11-24T18:17:28.106Z" },
 ]
 
 [[package]]
 name = "envlib"
-version = "0.1.8"
+version = "0.1.9"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "booklet" },
@@ -178,9 +178,9 @@ dependencies = [
     { name = "shapely" },
     { name = "urllib3" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/2d/b6/377d44105166ceb0d47c47e52e1f938a47c2c265a66638e1cc30bc81e4a0/envlib-0.1.8.tar.gz", hash = "sha256:ae1648e088bf752511c1d808cf1b14ec774528f4569d7e75312d6d4730f77468", size = 89473, upload-time = "2026-10-07T01:11:56.652Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/48/12/3c50019165eb984b5cccd5f9b3be5e886bc1c7af91f5e733bc982ccd39da/envlib-0.1.9.tar.gz", hash = "sha256:6db0dc775445dace184f343510f357995cbba912329996c535627e6c877ca7e0", size = 93275, upload-time = "2026-11-25T18:41:40.277Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/2f/aa/882ac68b33e2bcb3ab2e04f9a0b276c76e4c42a6ef370ddaed8082d495a4/envlib-0.1.8-py3-none-any.whl", hash = "sha256:c496f61104913428fa9f53a113cb04d18680cba6e1dd5647b47c6630d374e848", size = 92692, upload-time = "2026-10-07T01:11:54.854Z" },
+    { url = "https://files.pythonhosted.org/packages/d8/18/4264be3f56b72ff5b298b81bb9a9bf7dc35f6b171558603a768ba7a4f84a/envlib-0.1.9-py3-none-any.whl", hash = "sha256:3ed679ea4a955ff1a3a8fa3c07332cc9f2a5b76bd979db75ebf7b9ab9da58e0b", size = 96316, upload-time = "2026-11-25T18:41:38.665Z" },
 ]
 
 [[package]]
